@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         色花堂统一工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.3.3
-// @description  全局预览、自动签到、帖子收藏评分、收藏/主题页导出、打开页收藏、渐进全图、自动回复、后一页加载
+// @version      1.3.5
+// @description  全局预览、搜索筛选、自动签到、帖子收藏评分、代码复制、渐进全图、自动回复、后一页加载
 // @author       米波
 // @match        https://sehuatang.net/*
 // @match        https://www.sehuatang.net/*
@@ -25,6 +25,8 @@
         EXPORT_DELAY_MS: 500,
         NEXT_PAGE_COUNT: 1,
         NEXT_PAGE_DELAY_MS: 650,
+        SEARCH_FILTER_VISIBLE_FIDS_KEY: 'sht_search_filter_visible_fids',
+        SEARCH_FILTER_SHOW_UNKNOWN_KEY: 'sht_search_filter_show_unknown',
 
         AUTO_SIGN_KEY: 'sht_auto_sign_enabled',
         AUTO_SIGN_STATE_KEY: 'sht_auto_sign_state',
@@ -43,6 +45,7 @@
         FULL_IMAGE_TIMEOUT_MS: 12000,
         FULL_IMAGE_RESCAN_MS: 1500,
         FULL_IMAGE_MAX_RESCAN: 3,
+        THREAD_IMAGES_SHOWN_KEY: 'sht_thread_images_shown',
 
         AUTO_REPLY_KEY: 'sht_auto_reply_enabled',
         AUTO_REPLY_STATE_KEY: 'sht_auto_reply',
@@ -76,9 +79,12 @@
 
     var KEYS = {
         autoPreview: 'sht_unified_auto_preview',
+        searchVisibleFids: CONFIG.SEARCH_FILTER_VISIBLE_FIDS_KEY,
+        searchShowUnknown: CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY,
         autoSign: CONFIG.AUTO_SIGN_KEY,
         autoNextPages: 'sht_unified_auto_next_pages',
         autoScrollPages: 'sht_unified_auto_scroll_pages',
+        threadImagesShown: CONFIG.THREAD_IMAGES_SHOWN_KEY,
         autoReply: CONFIG.AUTO_REPLY_KEY,
     };
 
@@ -86,6 +92,7 @@
         threads: [],
         listMaxPage: 1,
         previewRunning: false,
+        previewVisible: true,
         searchCancelled: false,
         refreshTimer: null,
         listObserver: null,
@@ -101,6 +108,52 @@
         signMessage: '',
         threadActionRunning: false,
         threadActionMessage: '',
+        threadEnhanceTimer: null,
+    };
+
+    var SITE_MAP = {
+        '每日合集': 106,
+        '国产原创': 2,
+        '亚洲无码原创': 36,
+        '亚洲有码原创': 37,
+        '高清中文字幕': 103,
+        '三级写真': 107,
+        '素人有码系列': 104,
+        '欧美无码': 38,
+        '4K原版': 151,
+        '韩国主播': 152,
+        '动漫原创': 39,
+        '国产自拍': 41,
+        '中文字幕': 109,
+        '日韩无码': 42,
+        '日韩有码': 43,
+        '欧美风情': 44,
+        '卡通动漫': 45,
+        '剧情三级': 46,
+        '自提字幕区': 145,
+        '自译字幕区': 146,
+        '字幕分享区': 121,
+        '分享新区': 159,
+        '原创自拍区': 155,
+        '转贴自拍': 125,
+        '华人街拍区': 50,
+        '亚洲性爱': 48,
+        '欧美性爱': 49,
+        '原创人生': 154,
+        '乱伦人妻': 135,
+        '青春校园': 137,
+        '武侠虚幻': 138,
+        '激情都市': 136,
+        'TXT小说下载': 139,
+        '综合讨论区': 95,
+        '色花视频自拍': 124,
+        '网友原创区': 141,
+        '转帖交流区': 142,
+        '求片问答悬赏区': 143,
+        '投诉建议区': 96,
+        '禁言申诉区': 150,
+        '资源出售区': 97,
+        '投稿送邀请码': 157
     };
 
     function $(selector, root) {
@@ -114,6 +167,11 @@
     }
     function textOf(el) {
         return (el ? (el.textContent || el.innerText || '') : '').replace(/\s+/g, ' ').trim();
+    }
+    function siteItems() {
+        return Object.keys(SITE_MAP).map(function(name) {
+            return { name: name, fid: String(SITE_MAP[name]) };
+        });
     }
     function getBool(key, defaultValue) {
         var value = localStorage.getItem(key);
@@ -191,6 +249,9 @@
     function isForumDisplayPage() {
         return /forum\.php/i.test(location.pathname) && getParams().get('mod') === 'forumdisplay';
     }
+    function isSearchResultPage() {
+        return /search\.php/i.test(location.pathname) && getParams().get('mod') === 'forum';
+    }
     function isSiteHomeIndexPage() {
         var path = location.pathname.replace(/\/+$/, '') || '/';
         if (path === '/' || /\/index\.php$/i.test(path)) return true;
@@ -217,8 +278,11 @@
     function isListToolPage() {
         return isFavoritePage() || isUserThreadPage();
     }
+    function isAutoScrollNextPage() {
+        return isListToolPage() || isForumDisplayPage() || isSearchResultPage();
+    }
     function isNextPageLoadPage() {
-        return isListToolPage() || isForumDisplayPage();
+        return isListToolPage() || isForumDisplayPage() || isSearchResultPage();
     }
 
     function getUid() {
@@ -318,6 +382,10 @@
             '.shtx-input,.shtx-select{padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;}' +
             '.shtx-result-row{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px;}' +
             '.shtx-result-row a{color:#e74c3c;text-decoration:none;flex:1;word-break:break-all;line-height:1.4;}' +
+            '.shtx-code-copy{margin:4px 0 6px;padding:3px 8px;background:#3498db;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:12px;}' +
+            '.shtx-filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:6px 10px;margin:8px 0 10px;}' +
+            '.shtx-filter-item{display:flex;align-items:center;gap:6px;color:#333;font-size:12px;white-space:nowrap;}' +
+            '.shtx-filter-item input{accent-color:#e74c3c;}' +
             '.shtx-autoload-simple{padding:6px 0;border-bottom:1px solid #eee;}' +
             '.shtx-autoload-simple a{color:#e74c3c;text-decoration:none;word-break:break-all;}';
         document.head.appendChild(style);
@@ -383,19 +451,15 @@
     }
     function setListPreviewEnabled(on) {
         setBool(KEYS.autoPreview, on);
-        if (!isPreviewToolPage()) {
-            createToolbar();
-            return;
-        }
-        if (on) {
+        if (on && isPreviewToolPage()) {
+            STATE.previewVisible = true;
             setPreviewVisibility(true);
+            if (isSearchResultPage()) applySearchFilter();
             refreshThreads();
             loadAllPreviews();
-        } else {
-            setPreviewVisibility(false);
         }
         createToolbar();
-        updateListStatus(on ? '预览已开启' : '预览已关闭');
+        updateListStatus(on ? '自动预览已开启' : '自动预览已关闭');
     }
     function setAutoNextPagesEnabled(on) {
         setBool(KEYS.autoNextPages, on);
@@ -407,7 +471,7 @@
         setBool(KEYS.autoScrollPages, on);
         STATE.autoScrollEnd = false;
         createToolbar();
-        if (on && isListToolPage()) scheduleAutoScrollCheck();
+        if (on && isAutoScrollNextPage()) scheduleAutoScrollCheck();
         else updateNextStatus(on ? '滚动翻页已开启' : '滚动翻页已关闭');
     }
     function setFullImageLoadEnabled(on) {
@@ -449,13 +513,16 @@
         appendSwitchSetting(sign, '自动签到', '自动完成签到验证并记录累计 / 连续签到天数。', getBool(KEYS.autoSign, true), setAutoSignEnabled);
 
         var preview = appendSettingsSection(dlg.body, '全局预览', '除站点首页和帖子详情页外，识别到主题列表项的页面都会生效。');
-        appendSwitchSetting(preview, '自动预览图片', '自动给主题加载预览图，关闭后隐藏已加载预览。', getBool(KEYS.autoPreview, true), setListPreviewEnabled);
+        appendSwitchSetting(preview, '自动加载预览', '打开页面或列表新增内容时自动展开并加载预览；工具栏按钮仍可手动展开 / 收起。', getBool(KEYS.autoPreview, true), setListPreviewEnabled);
 
-        var list = appendSettingsSection(dlg.body, '收藏页 / 用户主题页', '这些设置在收藏页和用户主题页生效。');
+        var search = appendSettingsSection(dlg.body, '搜索页筛选', '在搜索结果页按板块显示或隐藏主题。');
+        search.appendChild(makeButton('打开板块筛选', 'blue', openSearchFilterDialog));
+
+        var list = appendSettingsSection(dlg.body, '收藏页 / 用户主题页 / 搜索页', '这些设置在收藏页、用户主题页和搜索结果页生效。');
         appendSwitchSetting(list, '滚动自动翻页', '滑到页面底部附近时，自动加载后一页内容。', getBool(KEYS.autoScrollPages, false), setAutoScrollPagesEnabled);
 
-        var next = appendSettingsSection(dlg.body, '板块页', '这些设置在板块列表页生效。');
-        appendSwitchSetting(next, '自动加载后一页', '打开后进入板块页会自动加载后一页，关闭后只保留手动加载。', getBool(KEYS.autoNextPages, false), setAutoNextPagesEnabled);
+        var next = appendSettingsSection(dlg.body, '板块页 / 搜索页', '这些设置在板块列表页和搜索结果页生效。');
+        appendSwitchSetting(next, '自动加载后一页', '打开后进入板块页或搜索页会自动加载后一页，关闭后只保留手动加载。', getBool(KEYS.autoNextPages, false), setAutoNextPagesEnabled);
 
         var image = appendSettingsSection(dlg.body, '帖子页', '这些设置在帖子详情页生效。');
         appendSwitchSetting(image, '全图渐进加载', '打开后分批加载整页图片，关闭后保持网站默认懒加载。', getBool(CONFIG.FULL_IMAGE_KEY, false), setFullImageLoadEnabled);
@@ -471,12 +538,14 @@
         if (isFavoritePage()) return '收藏页';
         if (isUserThreadPage()) return '用户主题页';
         if (isThreadPage()) return '帖子页';
+        if (isSearchResultPage()) return '搜索页';
         if (isForumDisplayPage()) return '板块页';
         return '普通页面';
     }
     function getPreviewStatusText() {
-        if (!getBool(KEYS.autoPreview, true)) return '关闭';
-        return STATE.previewRunning ? '加载中' : '开启';
+        if (STATE.previewRunning) return '加载中';
+        var auto = getBool(KEYS.autoPreview, true) ? '自动' : '手动';
+        return (STATE.previewVisible ? '已展开' : '已收起') + ' / ' + auto;
     }
     function getAutoScrollStatusText() {
         if (!getBool(KEYS.autoScrollPages, false)) return '关闭';
@@ -518,6 +587,19 @@
     function getThreadActionStatusText() {
         if (STATE.threadActionRunning) return '处理中';
         return STATE.threadActionMessage || '空闲';
+    }
+    function getPostImageStatusText() {
+        return getBool(KEYS.threadImagesShown, true) ? '显示' : '隐藏';
+    }
+    function getSearchFilterStatusText() {
+        if (!isSearchResultPage()) return '非搜索页';
+        var items = getSearchResultItems();
+        var visibleFids = getVisibleSearchFids();
+        var showUnknown = getBool(KEYS.searchShowUnknown, true);
+        var visible = items.filter(function(item) {
+            return item.fid ? visibleFids.indexOf(String(item.fid)) !== -1 : showUnknown;
+        }).length;
+        return visible + '/' + items.length + ' 显示';
     }
     function appendStatusLine(toolbar, id, label, value) {
         var row = document.createElement('div');
@@ -567,7 +649,12 @@
 
         if (hasPreviewTool) {
             ensureCommonSection();
-            bar.appendChild(makeButton('加载预览', 'blue', function() { refreshThreads(); loadAllPreviews(); updateListStatus('正在加载预览'); }));
+            bar.appendChild(makeButton(getPreviewToggleText(), 'blue', togglePreviewPanel));
+        }
+
+        if (isSearchResultPage()) {
+            ensureCommonSection();
+            bar.appendChild(makeButton('搜索筛选', 'green', openSearchFilterDialog));
         }
 
         if (hasListTool) {
@@ -581,6 +668,8 @@
 
         if (hasThreadTool) {
             ensureCommonSection();
+            bar.appendChild(makeButton('复制全部代码', 'blue', copyAllCodeBlocks));
+            bar.appendChild(makeButton(getPostImageToggleText(), 'orange', togglePostImages));
             bar.appendChild(makeButton('收藏本帖', 'blue', favoriteCurrentThread));
             bar.appendChild(makeButton('评分', 'orange', rateCurrentThread));
             bar.appendChild(makeButton('一键二连', 'red', twoActionCurrentThread));
@@ -602,6 +691,10 @@
             appendStatusLine(bar, 'preview', '预览', getPreviewStatusText());
         }
 
+        if (isSearchResultPage()) {
+            appendStatusLine(bar, 'search-filter', '搜索筛选', getSearchFilterStatusText());
+        }
+
         if (hasListTool) {
             appendStatusLine(bar, 'scroll', '滚动翻页', getAutoScrollStatusText());
             appendStatusLine(bar, 'next-message', '加载', getNextMessageText());
@@ -612,6 +705,7 @@
 
         if (hasThreadTool) {
             appendStatusLine(bar, 'thread-action', '帖子操作', getThreadActionStatusText());
+            appendStatusLine(bar, 'post-images', '帖内图片', getPostImageStatusText());
             appendStatusLine(bar, 'full-image', '全图加载', getFullImageStatusText());
             appendStatusLine(bar, 'full-message', '图片', STATE.fullImageRunning ? '处理中' : '空闲');
         }
@@ -652,6 +746,12 @@
     function updateThreadActionStatus(message) {
         if (message) STATE.threadActionMessage = message;
         setStatusLine('thread-action', getThreadActionStatusText());
+    }
+    function updatePostImageStatus() {
+        setStatusLine('post-images', getPostImageStatusText());
+    }
+    function updateSearchFilterStatus() {
+        setStatusLine('search-filter', getSearchFilterStatusText());
     }
     function updateSignStatus(message) {
         if (message) STATE.signMessage = message;
@@ -1142,14 +1242,16 @@
         }).then(function(resp) {
             return resp.text();
         }).then(function(text) {
-            var plain = htmlToPlainText(parseSignAjaxHtml(text));
-            if (/感谢您的参与|评分成功|成功评分/.test(plain)) {
+            var payload = parseSignAjaxHtml(text);
+            var plain = htmlToPlainText(payload);
+            var haystack = [String(text || ''), String(payload || ''), plain].join(' ');
+            if (/感谢您的参与|评分成功|成功评分|hideWindow\(['"]rate['"]\)|succeedhandle_rate|ratecredits/i.test(haystack)) {
                 return { state: 'success', label: '+' + rateInfo.max + ' 评分成功，已通知作者', score: rateInfo.max };
             }
-            if (/重复评分|不能对同一个帖子重复评分|自己发表/.test(plain)) {
+            if (/重复评分|不能对同一个帖子重复评分|自己发表/.test(haystack)) {
                 return { state: 'error', label: '不能重复评分，或不能给自己的帖子评分' };
             }
-            if (/请先登录|登录后|您需要登录/.test(plain)) return { state: 'error', label: '需要登录后才能评分' };
+            if (/请先登录|登录后|您需要登录/.test(haystack)) return { state: 'error', label: '需要登录后才能评分' };
             return { state: 'error', label: '评分失败' };
         }).catch(function() {
             return { state: 'error', label: '评分请求失败' };
@@ -1217,6 +1319,204 @@
         });
     }
 
+    // ---------------- 帖子页代码 / 图片 ----------------
+    function getThreadContentRoot() {
+        return $('#postlist') || document;
+    }
+    function getCodeBlocks() {
+        var seen = [];
+        var result = [];
+        $all('#postlist .blockcode, .t_fsz .blockcode, .pcb .blockcode').forEach(function(code) {
+            if (seen.indexOf(code) !== -1) return;
+            seen.push(code);
+            result.push(code);
+        });
+        return result;
+    }
+    function getCodeBlockText(code) {
+        var rows = $all('li', code);
+        if (rows.length) {
+            return rows.map(function(li) { return (li.innerText || li.textContent || '').replace(/\n/g, ''); }).join('\r\n');
+        }
+        return (code.innerText || code.textContent || '').replace(/^\s*复制代码\s*/i, '').trim();
+    }
+    function copyCodeBlock(code) {
+        var text = getCodeBlockText(code);
+        if (!text) { toast('未找到代码内容', 'error'); return; }
+        copyToClipboard(text);
+    }
+    function copyAllCodeBlocks() {
+        var blocks = getCodeBlocks();
+        var text = blocks.map(getCodeBlockText).filter(Boolean).join('\r\n\r\n');
+        if (!text) { toast('未找到代码块', 'error'); return; }
+        copyToClipboard(text);
+    }
+    function initCodeCopyButtons() {
+        getCodeBlocks().forEach(function(code) {
+            if (code.querySelector('.shtx-code-copy')) return;
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'shtx-code-copy';
+            btn.textContent = '复制代码';
+            btn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                copyCodeBlock(code);
+            });
+            code.insertBefore(btn, code.firstChild);
+        });
+    }
+    function getPostImageNodes() {
+        var result = [];
+        var seen = [];
+        $all('#postlist .t_fsz img, #postlist .t_f img, #postlist .pcb img').forEach(function(img) {
+            if (seen.indexOf(img) !== -1 || isInsideToolUi(img)) return;
+            if (img.closest('.pls, .avt, .shtx-preview-container')) return;
+            if (!getRealImageUrl(img)) return;
+            seen.push(img);
+            result.push(img);
+        });
+        return result;
+    }
+    function getPostImageToggleText() {
+        return getBool(KEYS.threadImagesShown, true) ? '隐藏图片' : '显示图片';
+    }
+    function applyPostImageVisibility() {
+        var visible = getBool(KEYS.threadImagesShown, true);
+        getPostImageNodes().forEach(function(img) {
+            img.style.display = visible ? '' : 'none';
+        });
+    }
+    function togglePostImages() {
+        var visible = !getBool(KEYS.threadImagesShown, true);
+        setBool(KEYS.threadImagesShown, visible);
+        applyPostImageVisibility();
+        createToolbar();
+        updatePostImageStatus();
+        toast(visible ? '已显示帖内图片' : '已隐藏帖内图片');
+    }
+    function initThreadEnhancements() {
+        if (!isThreadPage()) return;
+        initCodeCopyButtons();
+        applyPostImageVisibility();
+    }
+    function scheduleThreadEnhancements() {
+        if (!isThreadPage()) return;
+        if (STATE.threadEnhanceTimer) clearTimeout(STATE.threadEnhanceTimer);
+        STATE.threadEnhanceTimer = setTimeout(function() {
+            STATE.threadEnhanceTimer = null;
+            initThreadEnhancements();
+        }, 300);
+    }
+
+    // ---------------- 搜索页板块筛选 ----------------
+    function getAllSearchFids() {
+        return siteItems().map(function(item) { return item.fid; });
+    }
+    function getVisibleSearchFids() {
+        var saved = readJson(KEYS.searchVisibleFids, null);
+        if (!Array.isArray(saved)) return getAllSearchFids();
+        return saved.map(String);
+    }
+    function saveVisibleSearchFids(fids) {
+        writeJson(KEYS.searchVisibleFids, (fids || []).map(String));
+    }
+    function getFidFromHref(href) {
+        var value = String(href || '');
+        var m = value.match(/[?&]fid=(\d+)/) || value.match(/forum-(\d+)-\d+\.html/i) || value.match(/fid-(\d+)/i);
+        return m ? m[1] : '';
+    }
+    function getSearchItemFid(node) {
+        if (!node) return '';
+        var fid = '';
+        var links = $all('a[href]', node);
+        for (var i = 0; i < links.length; i++) {
+            var href = links[i].getAttribute('href') || links[i].href || '';
+            if (/forumdisplay|forum-\d+-|fid=|fid-\d+/i.test(href)) {
+                fid = getFidFromHref(href);
+                if (fid) return fid;
+            }
+        }
+        var text = textOf(node);
+        var items = siteItems();
+        for (var j = 0; j < items.length; j++) {
+            if (text.indexOf(items[j].name) !== -1) return items[j].fid;
+        }
+        return '';
+    }
+    function getSearchResultItems() {
+        if (!isSearchResultPage()) return [];
+        var pairs = [];
+        $all('a[href*="viewthread"][href*="tid="]').forEach(function(a) {
+            if (isInsideToolUi(a)) return;
+            var tid = getTidFromHref(a.getAttribute('href') || a.href);
+            if (!tid) return;
+            var node = getThreadItemNode(a) || a.closest('tbody, tr, li, dl, .bbda, .pbw');
+            if (!node || isDocumentShellNode(node)) return;
+            for (var i = 0; i < pairs.length; i++) {
+                if (pairs[i].node === node || pairs[i].tid === tid) return;
+            }
+            var fid = getSearchItemFid(node);
+            pairs.push({ tid: tid, node: node, fid: fid, visible: true });
+        });
+        return pairs;
+    }
+    function setSearchItemVisible(item, visible) {
+        item.visible = visible;
+        if (item.node) item.node.style.display = visible ? '' : 'none';
+        var preview = getPreviewWrapperForAnchor(item.node, item.tid);
+        if (preview) preview.style.display = visible && STATE.previewVisible ? '' : 'none';
+    }
+    function applySearchFilter() {
+        if (!isSearchResultPage()) return;
+        var visibleFids = getVisibleSearchFids();
+        var showUnknown = getBool(KEYS.searchShowUnknown, true);
+        getSearchResultItems().forEach(function(item) {
+            var visible = item.fid ? visibleFids.indexOf(String(item.fid)) !== -1 : showUnknown;
+            setSearchItemVisible(item, visible);
+        });
+        updateSearchFilterStatus();
+    }
+    function openSearchFilterDialog() {
+        var dlg = createDialog('搜索页板块筛选', '760px');
+        var visibleFids = getVisibleSearchFids();
+        var visibleMap = {};
+        visibleFids.forEach(function(fid) { visibleMap[String(fid)] = true; });
+        var showUnknown = getBool(KEYS.searchShowUnknown, true);
+        var items = siteItems();
+        dlg.body.innerHTML =
+            '<div class="shtx-settings-note">勾选要显示的板块，未勾选的板块会在搜索结果页隐藏。这个设置会保存，并在所有搜索结果页生效。</div>' +
+            '<div class="shtx-row">' +
+            '<button class="shtx-btn shtx-blue" id="shtx-filter-all" type="button">全选</button>' +
+            '<button class="shtx-btn shtx-gray" id="shtx-filter-none" type="button">全不选</button>' +
+            '<label class="shtx-filter-item"><input id="shtx-filter-unknown" type="checkbox"' + (showUnknown ? ' checked' : '') + '>显示未识别板块</label>' +
+            '</div>' +
+            '<div class="shtx-filter-grid">' + items.map(function(item) {
+                return '<label class="shtx-filter-item"><input type="checkbox" class="shtx-filter-fid" value="' + escapeHtml(item.fid) + '"' + (visibleMap[item.fid] ? ' checked' : '') + '>' + escapeHtml(item.name) + '</label>';
+            }).join('') + '</div>';
+
+        function collectAndApply() {
+            var selected = $all('.shtx-filter-fid:checked', dlg.body).map(function(input) { return input.value; });
+            saveVisibleSearchFids(selected);
+            setBool(KEYS.searchShowUnknown, !!$('#shtx-filter-unknown', dlg.body).checked);
+            applySearchFilter();
+            createToolbar();
+        }
+        $all('.shtx-filter-fid', dlg.body).forEach(function(input) {
+            input.addEventListener('change', collectAndApply);
+        });
+        $('#shtx-filter-unknown', dlg.body).addEventListener('change', collectAndApply);
+        $('#shtx-filter-all', dlg.body).onclick = function() {
+            $all('.shtx-filter-fid', dlg.body).forEach(function(input) { input.checked = true; });
+            collectAndApply();
+        };
+        $('#shtx-filter-none', dlg.body).onclick = function() {
+            $all('.shtx-filter-fid', dlg.body).forEach(function(input) { input.checked = false; });
+            collectAndApply();
+        };
+        dlg.foot.textContent = isSearchResultPage() ? ('当前页：' + getSearchFilterStatusText()) : '打开搜索结果页后会按这里的设置筛选。';
+    }
+
     // ---------------- 收藏页 / 用户主题页 ----------------
     function getTidFromHref(href) {
         var m = String(href || '').match(/[?&]tid=(\d+)/);
@@ -1262,7 +1562,7 @@
         STATE.threads = getThreadsWithLinks(document);
         STATE.listMaxPage = Math.max(STATE.listMaxPage || 1, detectMaxPage(document));
         updateListStatus();
-        if (STATE.threads.length !== before && getBool(KEYS.autoPreview, true)) loadAllPreviews();
+        if (STATE.threads.length !== before && getBool(KEYS.autoPreview, true) && STATE.previewVisible) loadAllPreviews();
     }
     function scheduleRefreshThreads() {
         if (STATE.refreshTimer) clearTimeout(STATE.refreshTimer);
@@ -1272,10 +1572,12 @@
         }, 500);
     }
     function initListTools() {
+        STATE.previewVisible = getBool(KEYS.autoPreview, true);
         if (isListToolPage()) STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, getCurrentPageNumber());
         if (!isPreviewToolPage()) return;
         refreshThreads();
         if (getBool(KEYS.autoPreview, true)) loadAllPreviews();
+        else setPreviewVisibility(false);
         if (!STATE.listObserver && window.MutationObserver) {
             STATE.listObserver = new MutationObserver(function(mutations) {
                 for (var i = 0; i < mutations.length; i++) {
@@ -1295,6 +1597,28 @@
     }
     function toggleListPreview() {
         setListPreviewEnabled(!getBool(KEYS.autoPreview, true));
+    }
+    function getPreviewToggleText() {
+        if (STATE.previewRunning) return '预览加载中';
+        return STATE.previewVisible ? '收起预览' : '展开预览';
+    }
+    function togglePreviewPanel() {
+        if (!isPreviewToolPage()) return;
+        if (STATE.previewVisible) {
+            setPreviewVisibility(false);
+            updateListStatus('预览已收起');
+            createToolbar();
+            return;
+        }
+        setPreviewVisibility(true);
+        if (isSearchResultPage()) applySearchFilter();
+        refreshThreads();
+        updateListStatus('正在展开预览');
+        createToolbar();
+        loadAllPreviews().then(function() {
+            updateListStatus();
+            createToolbar();
+        });
     }
     function fetchImages(tid) {
         return fetch(ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(tid), { credentials: 'include' })
@@ -1323,6 +1647,7 @@
         return urls.slice(0, CONFIG.MAX_IMAGES);
     }
     function setPreviewVisibility(visible) {
+        STATE.previewVisible = !!visible;
         $all('.shtx-preview-row').forEach(function(el) { el.style.display = visible ? '' : 'none'; });
         $all('.shtx-preview-block').forEach(function(el) { el.style.display = visible ? 'block' : 'none'; });
         $all('.shtx-preview-container').forEach(function(el) { el.style.display = visible ? 'grid' : 'none'; });
@@ -1342,7 +1667,7 @@
         var container = document.createElement('div');
         container.className = 'shtx-preview-container';
         container.setAttribute('data-tid', thread.tid);
-        if (!getBool(KEYS.autoPreview, true)) container.style.display = 'none';
+        if (!STATE.previewVisible) container.style.display = 'none';
         if (imageUrls.length > 0) {
             imageUrls.forEach(function(url) {
                 var wrapper = document.createElement('a');
@@ -1361,10 +1686,12 @@
         }
         if (!container.children.length) return;
         insertPreviewAfterAnchor(anchor, thread.tid, container);
-        if (!getBool(KEYS.autoPreview, true)) setPreviewVisibility(false);
+        if (!STATE.previewVisible) setPreviewVisibility(false);
+        if (isSearchResultPage()) applySearchFilter();
     }
     function loadAllPreviews() {
         if (!isPreviewToolPage() || STATE.previewRunning) return Promise.resolve();
+        if (!STATE.previewVisible) return Promise.resolve();
         STATE.previewRunning = true;
         cleanupLegacyPanels();
         refreshThreads();
@@ -1736,8 +2063,9 @@
     function afterNextPagesAppended() {
         if (isPreviewToolPage()) {
             refreshThreads();
-            if (getBool(KEYS.autoPreview, true)) loadAllPreviews();
+            if (getBool(KEYS.autoPreview, true) && STATE.previewVisible) loadAllPreviews();
         }
+        if (isSearchResultPage()) applySearchFilter();
     }
     function loadNextFivePages(fromAuto) {
         if (!isNextPageLoadPage()) { toast('当前页面不支持加载后一页'); return; }
@@ -1814,7 +2142,7 @@
     }
 
     function scheduleAutoScrollCheck() {
-        if (!isListToolPage() || !getBool(KEYS.autoScrollPages, false)) return;
+        if (!isAutoScrollNextPage() || !getBool(KEYS.autoScrollPages, false)) return;
         if (STATE.autoScrollTimer) clearTimeout(STATE.autoScrollTimer);
         STATE.autoScrollTimer = setTimeout(function() {
             STATE.autoScrollTimer = null;
@@ -1823,13 +2151,13 @@
     }
 
     function checkAutoScrollPages() {
-        if (!isListToolPage() || !getBool(KEYS.autoScrollPages, false)) return;
+        if (!isAutoScrollNextPage() || !getBool(KEYS.autoScrollPages, false)) return;
         if (STATE.nextPagesLoading || STATE.autoScrollEnd) return;
         if (isNearPageBottom()) loadNextFivePages(true);
     }
 
     function initAutoScrollPages() {
-        if (!isListToolPage()) return;
+        if (!isAutoScrollNextPage()) return;
         window.addEventListener('scroll', scheduleAutoScrollCheck, { passive: true });
         window.addEventListener('resize', scheduleAutoScrollCheck);
         if (getBool(KEYS.autoScrollPages, false)) setTimeout(scheduleAutoScrollCheck, 800);
@@ -2016,7 +2344,9 @@
                 timer = null;
                 if (isPreviewToolPage()) scheduleRefreshThreads();
                 if (isThreadPage() && getBool(CONFIG.FULL_IMAGE_KEY, false) && !STATE.fullImageRunning) startFullImageLoad();
-                if (isListToolPage() && getBool(KEYS.autoScrollPages, false)) scheduleAutoScrollCheck();
+                if (isThreadPage()) scheduleThreadEnhancements();
+                if (isSearchResultPage()) applySearchFilter();
+                if (isAutoScrollNextPage() && getBool(KEYS.autoScrollPages, false)) scheduleAutoScrollCheck();
             }, 700);
         });
         observer.observe(document.body, { childList: true, subtree: true });
@@ -2121,7 +2451,9 @@
         cleanupLegacyPanels();
         initOpenRegistry();
         initListTools();
+        applySearchFilter();
         createToolbar();
+        initThreadEnhancements();
         initAutoSign(false);
         initAutoNextPages();
         initAutoScrollPages();
