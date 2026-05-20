@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         色花堂统一工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.3.1
-// @description  全局预览、收藏/主题页导出、打开页收藏、渐进全图、自动回复、后一页加载
+// @version      1.3.2
+// @description  全局预览、自动签到、收藏/主题页导出、打开页收藏、渐进全图、自动回复、后一页加载
 // @author       米波
 // @match        https://sehuatang.net/*
 // @match        https://www.sehuatang.net/*
@@ -25,6 +25,11 @@
         EXPORT_DELAY_MS: 500,
         NEXT_PAGE_COUNT: 1,
         NEXT_PAGE_DELAY_MS: 650,
+
+        AUTO_SIGN_KEY: 'sht_auto_sign_enabled',
+        AUTO_SIGN_STATE_KEY: 'sht_auto_sign_state',
+        AUTO_SIGN_SECQAAHASH: 'qSAxcb0',
+        AUTO_SIGN_DELAY_MS: 1200,
 
         OPEN_REGISTRY_KEY: 'sht_open_thread_tabs_v1',
         OPEN_TAB_ID_KEY: 'sht_open_thread_tab_id_v1',
@@ -71,6 +76,7 @@
 
     var KEYS = {
         autoPreview: 'sht_unified_auto_preview',
+        autoSign: CONFIG.AUTO_SIGN_KEY,
         autoNextPages: 'sht_unified_auto_next_pages',
         autoScrollPages: 'sht_unified_auto_scroll_pages',
         autoReply: CONFIG.AUTO_REPLY_KEY,
@@ -90,6 +96,9 @@
         loadedMaxPage: 1,
         fullImageRunning: false,
         fullImageCancelToken: 0,
+        signRunning: false,
+        signAutoStarted: false,
+        signMessage: '',
     };
 
     function $(selector, root) {
@@ -130,6 +139,20 @@
     }
     function escapeRegExp(value) {
         return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+    function safeEvalSimpleMath(expr) {
+        expr = String(expr || '').replace(/\s*=\s*\?\s*$/, '').trim();
+        var m = expr.match(/^(-?\d+(?:\.\d+)?)\s*([+\-*/])\s*(-?\d+(?:\.\d+)?)$/);
+        if (!m) return NaN;
+        var a = parseFloat(m[1]);
+        var b = parseFloat(m[3]);
+        switch (m[2]) {
+            case '+': return a + b;
+            case '-': return a - b;
+            case '*': return a * b;
+            case '/': return b !== 0 ? a / b : NaN;
+            default: return NaN;
+        }
     }
     function isInsideToolUi(el) {
         return !!(el && el.closest && el.closest('#shtx-toolbar, #shtx-dialog, #shtx-toast, .shtx-preview-container'));
@@ -396,6 +419,15 @@
         }
         createToolbar();
     }
+    function setAutoSignEnabled(on) {
+        setBool(KEYS.autoSign, on);
+        createToolbar();
+        if (on) initAutoSign(true);
+        else {
+            STATE.signMessage = '自动签到已关闭';
+            updateSignStatus();
+        }
+    }
     function setAutoReplyEnabled(on) {
         setBool(KEYS.autoReply, on);
         createToolbar();
@@ -410,6 +442,9 @@
     function openSettingsDialog() {
         var dlg = createDialog('工具设置', '600px');
         appendSettingsSection(dlg.body, '当前页面', '当前页面：' + getPageTypeLabel() + '。所有开关都会保存，只在对应页面自动生效。');
+
+        var sign = appendSettingsSection(dlg.body, '签到', '每天首次打开站点时自动尝试签到，也可以在左侧工具栏手动签到。');
+        appendSwitchSetting(sign, '自动签到', '自动完成签到验证并记录累计 / 连续签到天数。', getBool(KEYS.autoSign, true), setAutoSignEnabled);
 
         var preview = appendSettingsSection(dlg.body, '全局预览', '除站点首页和帖子详情页外，识别到主题列表项的页面都会生效。');
         appendSwitchSetting(preview, '自动预览图片', '自动给主题加载预览图，关闭后隐藏已加载预览。', getBool(KEYS.autoPreview, true), setListPreviewEnabled);
@@ -460,6 +495,21 @@
         if (!getBool(CONFIG.FULL_IMAGE_KEY, false)) return '关闭';
         return STATE.fullImageRunning ? '加载中' : '开启';
     }
+    function getSignStatusText() {
+        if (STATE.signRunning) return '签到中';
+        var info = getCurrentSignUserInfo();
+        var today = getDateKey(new Date());
+        if (info.lastSignDate === today) {
+            var parts = ['已签到'];
+            if (info.signCount) parts.push('累计' + info.signCount + '天');
+            if (info.signStreak) parts.push('连续' + info.signStreak + '天');
+            return parts.join(' / ');
+        }
+        if (!getBool(KEYS.autoSign, true)) return '关闭';
+        if (STATE.signMessage) return STATE.signMessage;
+        if (info.lastAttemptDate === today && info.lastResult === 'error') return '今日失败';
+        return '待签到';
+    }
     function getReplyStatusText() {
         return getBool(KEYS.autoReply, true) ? '开启' : '关闭';
     }
@@ -488,6 +538,7 @@
         var hasReplyTool = isThreadPage() && getFid() === CONFIG.AUTO_REPLY_TARGET_FID;
         var hasNextTool = isNextPageLoadPage();
         var hasPreviewTool = isPreviewToolPage();
+        var hasSignTool = true;
 
         var bar = document.createElement('div');
         bar.id = 'shtx-toolbar';
@@ -498,8 +549,18 @@
         bar.appendChild(title);
         bar.appendChild(makeButton('设置', 'red', openSettingsDialog));
 
-        if (hasPreviewTool) {
+        var commonSectionAdded = false;
+        function ensureCommonSection() {
+            if (commonSectionAdded) return;
             appendSection(bar, '常用操作');
+            commonSectionAdded = true;
+        }
+
+        ensureCommonSection();
+        bar.appendChild(makeButton(getSignButtonText(), getSignButtonColor(), handleSignButtonClick));
+
+        if (hasPreviewTool) {
+            ensureCommonSection();
             bar.appendChild(makeButton('加载预览', 'blue', function() { refreshThreads(); loadAllPreviews(); updateListStatus('正在加载预览'); }));
         }
 
@@ -508,23 +569,24 @@
             bar.appendChild(makeButton(isFavoritePage() ? '搜全部收藏' : '搜全部主题', 'blue', openSearchDialog));
             bar.appendChild(makeButton('导出资源', 'green', openExportDialog));
         } else if (hasNextTool) {
-            if (!hasPreviewTool) appendSection(bar, '常用操作');
+            ensureCommonSection();
             bar.appendChild(makeButton('加载后一页', 'green', function() { loadNextFivePages(false); }));
         }
 
         if (hasThreadTool) {
-            if (!hasPreviewTool && !hasListTool && !hasNextTool) appendSection(bar, '常用操作');
+            ensureCommonSection();
             bar.appendChild(makeButton('停止全图', 'gray', function() { stopFullImageLoad(); createToolbar(); updateFullImageStatus('已停止本页'); }));
         }
 
         if (hasOpenTool) {
-            if (!hasPreviewTool && !hasListTool && !hasNextTool && !hasThreadTool) appendSection(bar, '常用操作');
+            ensureCommonSection();
             bar.appendChild(makeButton('收藏打开帖子', 'red', openFavoriteDialog));
             bar.appendChild(makeButton('清理打开记录', 'gray', clearOpenThreadRecords));
         }
 
         appendSection(bar, '当前状态');
         appendStatusLine(bar, 'page', '页面', getPageTypeLabel());
+        appendStatusLine(bar, 'sign', '签到', getSignStatusText());
 
         if (hasPreviewTool) {
             appendStatusLine(bar, 'list-count', '主题', STATE.threads.length + ' 个');
@@ -552,7 +614,7 @@
             appendStatusLine(bar, 'open-count', '打开帖', openCount + ' 个');
         }
 
-        if (!hasOpenTool && !hasPreviewTool && !hasListTool && !hasThreadTool && !hasNextTool && !hasReplyTool) {
+        if (!hasOpenTool && !hasPreviewTool && !hasListTool && !hasThreadTool && !hasNextTool && !hasReplyTool && !hasSignTool) {
             appendStatusLine(bar, 'available', '功能', '暂无可用');
         }
 
@@ -576,6 +638,211 @@
     }
     function updateOpenStatus() {
         setStatusLine('open-count', getOpenThreads().length + ' 个');
+    }
+    function updateSignStatus(message) {
+        if (message) STATE.signMessage = message;
+        setStatusLine('sign', getSignStatusText());
+    }
+
+    function getSignButtonText() {
+        if (STATE.signRunning) return '签到中...';
+        return isSignedToday() ? '已签到' : '签到';
+    }
+    function getSignButtonColor() {
+        if (STATE.signRunning) return 'gray';
+        return isSignedToday() ? 'green' : 'orange';
+    }
+    function handleSignButtonClick() {
+        if (STATE.signRunning) return;
+        if (isSignedToday()) {
+            window.open(ORIGIN + '/plugin.php?id=dd_sign:index', '_blank');
+            return;
+        }
+        runAutoSign(true);
+    }
+
+    // ---------------- 自动签到 ----------------
+    function getDateKey(date) {
+        return date.getFullYear() + '-' + String(date.getMonth() + 1).padStart(2, '0') + '-' + String(date.getDate()).padStart(2, '0');
+    }
+    function getYesterdayKey(date) {
+        var d = new Date(date);
+        d.setDate(d.getDate() - 1);
+        return getDateKey(d);
+    }
+    function loadSignState() {
+        var state = readJson(CONFIG.AUTO_SIGN_STATE_KEY, {});
+        if (!state || typeof state !== 'object') state = {};
+        if (!state.users || typeof state.users !== 'object') state.users = {};
+        return state;
+    }
+    function saveSignState(state) {
+        writeJson(CONFIG.AUTO_SIGN_STATE_KEY, state);
+    }
+    function getCurrentUserIdForSign() {
+        var selectors = [
+            '#um a[href*="uid="]',
+            '.avt a[href*="uid="]',
+            'div.avt > a[href*="uid="]',
+            'a[href*="home.php?mod=space"][href*="uid="]'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            var link = $(selectors[i]);
+            if (!link) continue;
+            var href = link.getAttribute('href') || link.href || '';
+            var m = href.match(/[?&]uid=(\d+)|uid-(\d+)/);
+            if (m) return m[1] || m[2] || '';
+        }
+        return getUid() || '0';
+    }
+    function getSignUserInfo(state, uid) {
+        state = state || loadSignState();
+        uid = uid || getCurrentUserIdForSign();
+        if (!state.users[uid]) {
+            state.users[uid] = { lastSignDate: '', signCount: 0, signStreak: 0, lastAttemptDate: '', lastResult: '', lastMessage: '' };
+        }
+        return state.users[uid];
+    }
+    function getCurrentSignUserInfo() {
+        var state = loadSignState();
+        return getSignUserInfo(state, getCurrentUserIdForSign());
+    }
+    function isSignedToday() {
+        return getCurrentSignUserInfo().lastSignDate === getDateKey(new Date());
+    }
+    function rememberSignSuccess(message) {
+        var state = loadSignState();
+        var uid = getCurrentUserIdForSign();
+        var info = getSignUserInfo(state, uid);
+        var now = new Date();
+        var today = getDateKey(now);
+        if (info.lastSignDate !== today) {
+            var previous = info.lastSignDate || '';
+            info.signCount = (parseInt(info.signCount, 10) || 0) + 1;
+            info.signStreak = previous === getYesterdayKey(now) ? ((parseInt(info.signStreak, 10) || 0) + 1) : 1;
+            info.lastSignDate = today;
+        }
+        info.lastAttemptDate = today;
+        info.lastAttemptAt = Date.now();
+        info.lastResult = 'success';
+        info.lastMessage = message || '签到成功';
+        saveSignState(state);
+        return info;
+    }
+    function rememberSignFailure(message) {
+        var state = loadSignState();
+        var info = getSignUserInfo(state, getCurrentUserIdForSign());
+        info.lastAttemptDate = getDateKey(new Date());
+        info.lastAttemptAt = Date.now();
+        info.lastResult = 'error';
+        info.lastMessage = message || '签到失败';
+        saveSignState(state);
+    }
+    function parseSignAjaxHtml(text) {
+        text = String(text || '');
+        var xml = new DOMParser().parseFromString(text, 'text/xml');
+        var root = xml.getElementsByTagName('root')[0];
+        return root ? root.textContent : text;
+    }
+    function htmlToPlainText(html) {
+        return String(html || '').replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    }
+    function fetchSignInfo() {
+        var url = ORIGIN + '/plugin.php?id=dd_sign&mod=sign&infloat=yes&handlekey=pc_click_ddsign&inajax=1&ajaxtarget=fwin_content_pc_click_ddsign';
+        return fetch(url, { credentials: 'include' })
+            .then(function(resp) { return resp.text(); })
+            .then(function(text) {
+                var html = parseSignAjaxHtml(text);
+                var plain = htmlToPlainText(html);
+                if (/已经签到|已签到|今日已签/.test(plain)) return { already: true };
+                if (/请先登录|登录后|您需要登录/.test(plain)) return { error: '需要登录后才能签到' };
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var formhash = $('input[name="formhash"]', doc);
+                var signtoken = $('input[name="signtoken"]', doc);
+                var signform = $('form[name="login"]', doc) || $('form[id^="signform_"]', doc);
+                if (!formhash || !signtoken || !signform) return { error: '获取签到信息失败' };
+                var signhash = (signform.getAttribute('id') || '').replace(/^signform_/, '');
+                if (!signhash) return { error: '获取签到参数失败' };
+                return { formhash: formhash.value, signtoken: signtoken.value, signhash: signhash };
+            });
+    }
+    function fetchSignValidateText() {
+        return fetch(ORIGIN + '/misc.php?mod=secqaa&action=update&idhash=' + encodeURIComponent(CONFIG.AUTO_SIGN_SECQAAHASH), { credentials: 'include' })
+            .then(function(resp) { return resp.text(); })
+            .then(function(text) {
+                var normalized = String(text || '').replace("sectplcode[2] + '", '前').replace("' + sectplcode[3]", '后');
+                var m = normalized.match(/前([\s\S]+?)后/);
+                return m ? m[1] : '';
+            });
+    }
+    function submitSign(signInfo, answer) {
+        var data = new URLSearchParams();
+        data.append('formhash', signInfo.formhash);
+        data.append('signtoken', signInfo.signtoken);
+        data.append('secqaahash', CONFIG.AUTO_SIGN_SECQAAHASH);
+        data.append('secanswer', String(answer));
+        var url = ORIGIN + '/plugin.php?id=dd_sign&mod=sign&signsubmit=yes&handlekey=pc_click_ddsign&signhash=' + encodeURIComponent(signInfo.signhash) + '&inajax=1';
+        return fetch(url, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: data,
+        }).then(function(resp) { return resp.text(); });
+    }
+    function doSignRequest() {
+        return fetchSignInfo().then(function(signInfo) {
+            if (!signInfo) return { ok: false, message: '获取签到信息失败' };
+            if (signInfo.already) return { ok: true, message: '已经签到过啦，请明天再来' };
+            if (signInfo.error) return { ok: false, message: signInfo.error };
+            return fetchSignValidateText().then(function(expr) {
+                if (!expr) return { ok: false, message: '获取签到验证失败，请手动签到' };
+                var answer = safeEvalSimpleMath(expr);
+                if (isNaN(answer)) return { ok: false, message: '签到验证计算失败，请手动签到' };
+                return submitSign(signInfo, answer).then(function(text) {
+                    var plain = htmlToPlainText(parseSignAjaxHtml(text));
+                    if (/已经签到过|已经签到|今日已签|已签到/.test(plain)) return { ok: true, message: '已经签到过啦，请明天再来' };
+                    if (/签到成功|成功签到/.test(plain)) return { ok: true, message: '签到成功，金钱+2，明天记得来哦' };
+                    if (/请先登录|登录后|您需要登录/.test(plain)) return { ok: false, message: '需要登录后才能签到' };
+                    return { ok: false, message: '签到出现未知错误' };
+                });
+            });
+        }).catch(function() {
+            return { ok: false, message: '签到请求失败，请稍后重试' };
+        });
+    }
+    function runAutoSign(manual) {
+        if (STATE.signRunning) return;
+        if (!manual && !getBool(KEYS.autoSign, true)) return;
+        var today = getDateKey(new Date());
+        var info = getCurrentSignUserInfo();
+        if (!manual) {
+            if (info.lastSignDate === today) return;
+            if (info.lastAttemptDate === today && info.lastResult === 'error') return;
+        }
+        STATE.signRunning = true;
+        STATE.signMessage = '签到中';
+        updateSignStatus();
+        createToolbar();
+        doSignRequest().then(function(result) {
+            STATE.signRunning = false;
+            if (result.ok) {
+                var signed = rememberSignSuccess(result.message);
+                STATE.signMessage = '已签到';
+                toast(result.message + '，连续' + signed.signStreak + '天');
+            } else {
+                rememberSignFailure(result.message);
+                STATE.signMessage = result.message;
+                toast(result.message, 'error');
+            }
+            createToolbar();
+            updateSignStatus();
+        });
+    }
+    function initAutoSign(force) {
+        if (!force && STATE.signAutoStarted) return;
+        if (!getBool(KEYS.autoSign, true)) return;
+        STATE.signAutoStarted = true;
+        setTimeout(function() { runAutoSign(false); }, CONFIG.AUTO_SIGN_DELAY_MS);
     }
 
     // ---------------- 打开页收藏 ----------------
@@ -1665,6 +1932,7 @@
         initOpenRegistry();
         initListTools();
         createToolbar();
+        initAutoSign(false);
         initAutoNextPages();
         initAutoScrollPages();
         if (isThreadPage() && getBool(CONFIG.FULL_IMAGE_KEY, false)) setTimeout(startFullImageLoad, 800);
