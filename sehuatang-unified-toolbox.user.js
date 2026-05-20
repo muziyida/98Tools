@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂统一工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.3.5
+// @version      1.3.6
 // @description  全局预览、搜索筛选、自动签到、帖子收藏评分、代码复制、渐进全图、自动回复、后一页加载
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -84,6 +84,7 @@
         autoSign: CONFIG.AUTO_SIGN_KEY,
         autoNextPages: 'sht_unified_auto_next_pages',
         autoScrollPages: 'sht_unified_auto_scroll_pages',
+        toolbarCollapsed: 'sht_unified_toolbar_collapsed',
         threadImagesShown: CONFIG.THREAD_IMAGES_SHOWN_KEY,
         autoReply: CONFIG.AUTO_REPLY_KEY,
     };
@@ -348,7 +349,14 @@
         style.id = 'shtx-style';
         style.textContent =
             '.shtx-toolbar{position:fixed;top:50%;left:0;z-index:99999;transform:translateY(-50%);display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:12px 10px;background:#f8f9fa;border:1px solid #dee2e6;border-left:0;border-radius:0 8px 8px 0;box-shadow:2px 2px 10px rgba(0,0,0,0.15);max-width:200px;font:12px/1.4 Arial,"Microsoft YaHei",sans-serif;color:#555;}' +
+            '.shtx-toolbar-head{display:flex;align-items:center;justify-content:space-between;gap:8px;}' +
+            '.shtx-toolbar-body{display:flex;flex-direction:column;align-items:stretch;gap:6px;}' +
+            '.shtx-toolbar.shtx-collapsed{padding:8px 6px;min-width:0;}' +
+            '.shtx-toolbar.shtx-collapsed .shtx-title{display:none;}' +
+            '.shtx-toolbar.shtx-collapsed .shtx-toolbar-body{display:none;}' +
+            '.shtx-toolbar.shtx-collapsed .shtx-toolbar-head{justify-content:center;}' +
             '.shtx-title{font-weight:bold;font-size:13px;color:#e74c3c;white-space:nowrap;margin-bottom:2px;}' +
+            '.shtx-collapse-btn{flex:0 0 auto;width:42px;height:24px;padding:0;border:0;border-radius:4px;background:#e74c3c;color:#fff;cursor:pointer;font-size:12px;font-weight:bold;line-height:24px;}' +
             '.shtx-section-title{font-size:12px;color:#666;border-top:1px solid #e4e7eb;padding-top:6px;margin-top:4px;white-space:nowrap;}' +
             '.shtx-section-title:first-child{border-top:0;padding-top:0;margin-top:0;}' +
             '.shtx-btn{padding:6px 12px;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap;font-weight:bold;}' +
@@ -612,6 +620,26 @@
         var el = $('#shtx-status-' + id + ' .shtx-status-value');
         if (el) el.textContent = value;
     }
+    function getToolbarCollapsed() {
+        return getBool(KEYS.toolbarCollapsed, false);
+    }
+    function setToolbarCollapseButton(btn, collapsed) {
+        if (!btn) return;
+        btn.textContent = collapsed ? '展开' : '收起';
+        btn.title = collapsed ? '展开工具栏' : '收起工具栏';
+        btn.setAttribute('aria-label', btn.title);
+        btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    }
+    function applyToolbarCollapsed(bar, collapsed) {
+        if (!bar) return;
+        bar.classList.toggle('shtx-collapsed', !!collapsed);
+        setToolbarCollapseButton($('.shtx-collapse-btn', bar), !!collapsed);
+    }
+    function toggleToolbarCollapsed() {
+        var collapsed = !getToolbarCollapsed();
+        setBool(KEYS.toolbarCollapsed, collapsed);
+        applyToolbarCollapsed($('#shtx-toolbar'), collapsed);
+    }
 
     function createToolbar() {
         cleanupLegacyPanels();
@@ -630,11 +658,20 @@
 
         var bar = document.createElement('div');
         bar.id = 'shtx-toolbar';
-        bar.className = 'shtx-toolbar';
+        bar.className = 'shtx-toolbar' + (getToolbarCollapsed() ? ' shtx-collapsed' : '');
+        var head = document.createElement('div');
+        head.className = 'shtx-toolbar-head';
         var title = document.createElement('div');
         title.className = 'shtx-title';
         title.textContent = '色花堂工具箱';
-        bar.appendChild(title);
+        head.appendChild(title);
+        var collapseBtn = document.createElement('button');
+        collapseBtn.type = 'button';
+        collapseBtn.className = 'shtx-collapse-btn';
+        collapseBtn.addEventListener('click', toggleToolbarCollapsed);
+        setToolbarCollapseButton(collapseBtn, getToolbarCollapsed());
+        head.appendChild(collapseBtn);
+        bar.appendChild(head);
         bar.appendChild(makeButton('设置', 'red', openSettingsDialog));
 
         var commonSectionAdded = false;
@@ -722,6 +759,11 @@
             appendStatusLine(bar, 'available', '功能', '暂无可用');
         }
 
+        var body = document.createElement('div');
+        body.className = 'shtx-toolbar-body';
+        while (head.nextSibling) body.appendChild(head.nextSibling);
+        bar.appendChild(body);
+        applyToolbarCollapsed(bar, getToolbarCollapsed());
         document.body.appendChild(bar);
     }
 
@@ -1447,7 +1489,7 @@
     function getSearchResultItems() {
         if (!isSearchResultPage()) return [];
         var pairs = [];
-        $all('a[href*="viewthread"][href*="tid="]').forEach(function(a) {
+        $all('a[href*="viewthread"][href*="tid="], a[href*="thread-"]').forEach(function(a) {
             if (isInsideToolUi(a)) return;
             var tid = getTidFromHref(a.getAttribute('href') || a.href);
             if (!tid) return;
@@ -1519,7 +1561,7 @@
 
     // ---------------- 收藏页 / 用户主题页 ----------------
     function getTidFromHref(href) {
-        var m = String(href || '').match(/[?&]tid=(\d+)/);
+        var m = String(href || '').match(/[?&]tid=(\d+)/) || String(href || '').match(/thread-(\d+)-\d+-\d+\.html/i);
         return m ? m[1] : '';
     }
     function titleScore(a, title) {
@@ -1530,7 +1572,7 @@
     }
     function getThreadsWithLinks(root) {
         root = root || document;
-        var links = root.querySelectorAll('a[href*="viewthread"][href*="tid="]');
+        var links = root.querySelectorAll('a[href*="viewthread"][href*="tid="], a[href*="thread-"]');
         var map = {};
         forEachNode(links, function(a) {
             if (isInsideToolUi(a)) return;
@@ -1586,8 +1628,8 @@
                         if (!node || node.nodeType !== 1) return false;
                         if (isInsideToolUi(node)) return false;
                         if (node.classList && node.classList.contains('shtx-preview-container')) return false;
-                        if (node.matches && node.matches('a[href*="viewthread"][href*="tid="]')) return true;
-                        return !!(node.querySelector && node.querySelector('a[href*="viewthread"][href*="tid="]'));
+                        if (node.matches && node.matches('a[href*="viewthread"][href*="tid="], a[href*="thread-"]')) return true;
+                        return !!(node.querySelector && node.querySelector('a[href*="viewthread"][href*="tid="], a[href*="thread-"]'));
                     });
                     if (hasThread) { scheduleRefreshThreads(); break; }
                 }
@@ -1896,6 +1938,10 @@
     }
     function buildNextPageUrl(page) {
         if (isFavoritePage()) return buildListPageUrl(page);
+        if (isSearchResultPage()) {
+            var pageLink = $('.pg a[href*="page=' + page + '"], .pg a[href*="page%3D' + page + '"], a[href*="search.php"][href*="page=' + page + '"]');
+            if (pageLink) return normalizeUrl(pageLink.getAttribute('href') || pageLink.href);
+        }
         var url = new URL(location.href);
         url.searchParams.set('page', page);
         return url.href;
@@ -1903,7 +1949,7 @@
     function getUniqueThreadTidsInNode(node) {
         var tids = {};
         if (!node || !node.querySelectorAll) return tids;
-        $all('a[href*="viewthread"][href*="tid="]', node).forEach(function(a) {
+        $all('a[href*="viewthread"][href*="tid="], a[href*="thread-"]', node).forEach(function(a) {
             if (isInsideToolUi(a)) return;
             var tid = getTidFromHref(a.getAttribute('href') || a.href);
             if (tid) tids[tid] = true;
