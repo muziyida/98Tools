@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂统一工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.3.6
+// @version      1.5.0
 // @description  全局预览、搜索筛选、自动签到、帖子收藏评分、代码复制、渐进全图、自动回复、后一页加载
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -24,7 +24,10 @@
         ALL_PAGES: 120,
         EXPORT_DELAY_MS: 500,
         NEXT_PAGE_COUNT: 1,
-        NEXT_PAGE_DELAY_MS: 650,
+        NEXT_PAGE_DELAY_MS: 120,
+        NEXT_PAGE_TIMEOUT_MS: 15000,
+        AUTO_SCROLL_DEBOUNCE_MS: 50,
+        AUTO_SCROLL_BOTTOM_THRESHOLD: 900,
         SEARCH_FILTER_VISIBLE_FIDS_KEY: 'sht_search_filter_visible_fids',
         SEARCH_FILTER_SHOW_UNKNOWN_KEY: 'sht_search_filter_show_unknown',
 
@@ -101,6 +104,9 @@
         nextPagesAutoStarted: false,
         autoScrollEnd: false,
         autoScrollTimer: null,
+        autoScrollNeedsUserAction: false,
+        autoScrollLastTop: 0,
+        autoScrollLastLoadAt: 0,
         loadedMaxPage: 1,
         fullImageRunning: false,
         fullImageCancelToken: 0,
@@ -348,7 +354,7 @@
         var style = document.createElement('style');
         style.id = 'shtx-style';
         style.textContent =
-            '.shtx-toolbar{position:fixed;top:50%;left:0;z-index:99999;transform:translateY(-50%);display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:12px 10px;background:#f8f9fa;border:1px solid #dee2e6;border-left:0;border-radius:0 8px 8px 0;box-shadow:2px 2px 10px rgba(0,0,0,0.15);max-width:200px;font:12px/1.4 Arial,"Microsoft YaHei",sans-serif;color:#555;}' +
+            '.shtx-toolbar{position:fixed;top:50%;right:0;z-index:99999;transform:translateY(-50%);display:flex;flex-direction:column;align-items:stretch;gap:6px;padding:12px 10px;background:#f8f9fa;border:1px solid #dee2e6;border-right:0;border-radius:8px 0 0 8px;box-shadow:-2px 2px 10px rgba(0,0,0,0.15);max-width:200px;font:12px/1.4 Arial,"Microsoft YaHei",sans-serif;color:#555;}' +
             '.shtx-toolbar-head{display:flex;align-items:center;justify-content:space-between;gap:8px;}' +
             '.shtx-toolbar-body{display:flex;flex-direction:column;align-items:stretch;gap:6px;}' +
             '.shtx-toolbar.shtx-collapsed{padding:8px 6px;min-width:0;}' +
@@ -395,7 +401,10 @@
             '.shtx-filter-item{display:flex;align-items:center;gap:6px;color:#333;font-size:12px;white-space:nowrap;}' +
             '.shtx-filter-item input{accent-color:#e74c3c;}' +
             '.shtx-autoload-simple{padding:6px 0;border-bottom:1px solid #eee;}' +
-            '.shtx-autoload-simple a{color:#e74c3c;text-decoration:none;word-break:break-all;}';
+            '.shtx-autoload-simple a{color:#e74c3c;text-decoration:none;word-break:break-all;}' +
+            '.pg .shtx-page-current{background:#e74c3c!important;border-color:#e74c3c!important;color:#fff!important;font-weight:bold!important;}' +
+            '.pg strong.shtx-page-not-current{background:#fff!important;color:#333!important;font-weight:normal!important;}' +
+            '#shtx-scroll-sentinel{display:block;clear:both;width:1px;height:1px;overflow:hidden;pointer-events:none;}';
         document.head.appendChild(style);
     }
 
@@ -424,9 +433,12 @@
             '<div class="shtx-dialog-head"><span style="font-weight:bold;font-size:14px;">' + escapeHtml(title) + '</span><button class="shtx-close">&times;</button></div>' +
             '<div class="shtx-dialog-body"></div>' +
             '<div class="shtx-dialog-foot"></div>';
-        $('.shtx-close', dlg).onclick = function() { dlg.remove(); };
+        function closeDialog() {
+            dlg.remove();
+        }
+        $('.shtx-close', dlg).onclick = closeDialog;
         document.body.appendChild(dlg);
-        return { root: dlg, body: $('.shtx-dialog-body', dlg), foot: $('.shtx-dialog-foot', dlg), close: function() { dlg.remove(); } };
+        return { root: dlg, body: $('.shtx-dialog-body', dlg), foot: $('.shtx-dialog-foot', dlg), close: closeDialog };
     }
 
     function appendSettingsSection(parent, title, note) {
@@ -478,6 +490,7 @@
     function setAutoScrollPagesEnabled(on) {
         setBool(KEYS.autoScrollPages, on);
         STATE.autoScrollEnd = false;
+        STATE.autoScrollNeedsUserAction = false;
         createToolbar();
         if (on && isAutoScrollNextPage()) scheduleAutoScrollCheck();
         else updateNextStatus(on ? '滚动翻页已开启' : '滚动翻页已关闭');
@@ -517,7 +530,8 @@
         var dlg = createDialog('工具设置', '600px');
         appendSettingsSection(dlg.body, '当前页面', '当前页面：' + getPageTypeLabel() + '。所有开关都会保存，只在对应页面自动生效。');
 
-        var sign = appendSettingsSection(dlg.body, '签到', '每天首次打开站点时自动尝试签到，也可以在左侧工具栏手动签到。');
+        var sign = appendSettingsSection(dlg.body, '签到', '每天首次打开站点时自动尝试签到。当前状态只在这里显示。');
+        appendSignSettingsStatus(sign);
         appendSwitchSetting(sign, '自动签到', '自动完成签到验证并记录累计 / 连续签到天数。', getBool(KEYS.autoSign, true), setAutoSignEnabled);
 
         var preview = appendSettingsSection(dlg.body, '全局预览', '除站点首页和帖子详情页外，识别到主题列表项的页面都会生效。');
@@ -551,7 +565,6 @@
         return '普通页面';
     }
     function getPreviewStatusText() {
-        if (STATE.previewRunning) return '加载中';
         var auto = getBool(KEYS.autoPreview, true) ? '自动' : '手动';
         return (STATE.previewVisible ? '已展开' : '已收起') + ' / ' + auto;
     }
@@ -559,7 +572,11 @@
         if (!getBool(KEYS.autoScrollPages, false)) return '关闭';
         if (STATE.nextPagesLoading) return '加载中';
         if (STATE.autoScrollEnd) return '已到底';
+        if (STATE.autoScrollNeedsUserAction) return '等待滚动';
         return '开启';
+    }
+    function getAutoScrollButtonText() {
+        return getBool(KEYS.autoScrollPages, false) ? '关闭滚动翻页' : '开启滚动翻页';
     }
     function getAutoNextStatusText() {
         if (!getBool(KEYS.autoNextPages, false)) return '关闭';
@@ -568,6 +585,7 @@
     function getNextMessageText() {
         if (STATE.nextPagesLoading) return '加载中';
         if (STATE.autoScrollEnd) return '没有更多页面';
+        if (STATE.autoScrollNeedsUserAction) return '等待继续滚动';
         return '空闲';
     }
     function getFullImageStatusText() {
@@ -589,6 +607,14 @@
         if (info.lastAttemptDate === today && info.lastResult === 'error') return '今日失败';
         return '待签到';
     }
+    function appendSignSettingsStatus(parent) {
+        var row = document.createElement('div');
+        row.id = 'shtx-settings-sign-status';
+        row.className = 'shtx-status-line';
+        row.style.margin = '6px 0 2px';
+        row.innerHTML = '<span class="shtx-status-label">当前状态</span><span class="shtx-status-value">' + escapeHtml(getSignStatusText()) + '</span>';
+        parent.appendChild(row);
+    }
     function getReplyStatusText() {
         return getBool(KEYS.autoReply, true) ? '开启' : '关闭';
     }
@@ -608,6 +634,18 @@
             return item.fid ? visibleFids.indexOf(String(item.fid)) !== -1 : showUnknown;
         }).length;
         return visible + '/' + items.length + ' 显示';
+    }
+    function getThreadCountStatusText() {
+        if (isSearchResultPage()) {
+            var items = getSearchResultItems();
+            var visibleFids = getVisibleSearchFids();
+            var showUnknown = getBool(KEYS.searchShowUnknown, true);
+            var visible = items.filter(function(item) {
+                return item.fid ? visibleFids.indexOf(String(item.fid)) !== -1 : showUnknown;
+            }).length;
+            return visible + '/' + items.length + ' 个';
+        }
+        return STATE.threads.length + ' 个';
     }
     function appendStatusLine(toolbar, id, label, value) {
         var row = document.createElement('div');
@@ -654,7 +692,6 @@
         var hasReplyTool = isThreadPage() && getFid() === CONFIG.AUTO_REPLY_TARGET_FID;
         var hasNextTool = isNextPageLoadPage();
         var hasPreviewTool = isPreviewToolPage();
-        var hasSignTool = true;
 
         var bar = document.createElement('div');
         bar.id = 'shtx-toolbar';
@@ -681,9 +718,6 @@
             commonSectionAdded = true;
         }
 
-        ensureCommonSection();
-        bar.appendChild(makeButton(getSignButtonText(), getSignButtonColor(), handleSignButtonClick));
-
         if (hasPreviewTool) {
             ensureCommonSection();
             bar.appendChild(makeButton(getPreviewToggleText(), 'blue', togglePreviewPanel));
@@ -696,11 +730,13 @@
 
         if (hasListTool) {
             bar.appendChild(makeButton('加载后一页', 'green', function() { loadNextFivePages(false); }));
+            bar.appendChild(makeButton(getAutoScrollButtonText(), 'orange', toggleAutoScrollPages));
             bar.appendChild(makeButton(isFavoritePage() ? '搜全部收藏' : '搜全部主题', 'blue', openSearchDialog));
             bar.appendChild(makeButton('导出资源', 'green', openExportDialog));
         } else if (hasNextTool) {
             ensureCommonSection();
             bar.appendChild(makeButton('加载后一页', 'green', function() { loadNextFivePages(false); }));
+            bar.appendChild(makeButton(getAutoScrollButtonText(), 'orange', toggleAutoScrollPages));
         }
 
         if (hasThreadTool) {
@@ -721,10 +757,9 @@
 
         appendSection(bar, '当前状态');
         appendStatusLine(bar, 'page', '页面', getPageTypeLabel());
-        appendStatusLine(bar, 'sign', '签到', getSignStatusText());
 
         if (hasPreviewTool) {
-            appendStatusLine(bar, 'list-count', '主题', STATE.threads.length + ' 个');
+            appendStatusLine(bar, 'list-count', '主题', getThreadCountStatusText());
             appendStatusLine(bar, 'preview', '预览', getPreviewStatusText());
         }
 
@@ -737,6 +772,7 @@
             appendStatusLine(bar, 'next-message', '加载', getNextMessageText());
         } else if (hasNextTool) {
             appendStatusLine(bar, 'next-auto', '自动后一页', getAutoNextStatusText());
+            appendStatusLine(bar, 'scroll', '滚动翻页', getAutoScrollStatusText());
             appendStatusLine(bar, 'next-message', '加载', getNextMessageText());
         }
 
@@ -755,7 +791,7 @@
             appendStatusLine(bar, 'open-count', '打开帖', openCount + ' 个');
         }
 
-        if (!hasOpenTool && !hasPreviewTool && !hasListTool && !hasThreadTool && !hasNextTool && !hasReplyTool && !hasSignTool) {
+        if (!hasOpenTool && !hasPreviewTool && !hasListTool && !hasThreadTool && !hasNextTool && !hasReplyTool) {
             appendStatusLine(bar, 'available', '功能', '暂无可用');
         }
 
@@ -768,7 +804,7 @@
     }
 
     function updateListStatus(message) {
-        setStatusLine('list-count', STATE.threads.length + ' 个');
+        setStatusLine('list-count', getThreadCountStatusText());
         setStatusLine('preview', getPreviewStatusText());
         setStatusLine('scroll', getAutoScrollStatusText());
         setStatusLine('next-message', message || getNextMessageText());
@@ -798,23 +834,8 @@
     function updateSignStatus(message) {
         if (message) STATE.signMessage = message;
         setStatusLine('sign', getSignStatusText());
-    }
-
-    function getSignButtonText() {
-        if (STATE.signRunning) return '签到中...';
-        return isSignedToday() ? '已签到' : '签到';
-    }
-    function getSignButtonColor() {
-        if (STATE.signRunning) return 'gray';
-        return isSignedToday() ? 'green' : 'orange';
-    }
-    function handleSignButtonClick() {
-        if (STATE.signRunning) return;
-        if (isSignedToday()) {
-            window.open(ORIGIN + '/plugin.php?id=dd_sign:index', '_blank');
-            return;
-        }
-        runAutoSign(true);
+        var settingsStatus = $('#shtx-settings-sign-status .shtx-status-value');
+        if (settingsStatus) settingsStatus.textContent = getSignStatusText();
     }
 
     // ---------------- 自动签到 ----------------
@@ -984,7 +1005,8 @@
             if (result.ok) {
                 var signed = rememberSignSuccess(result.message);
                 STATE.signMessage = '已签到';
-                toast(result.message + '，连续' + signed.signStreak + '天');
+                var alreadySigned = /已经签到|已签到|今日已签|已经签到过|请明天再来/.test(result.message || '');
+                if (manual || !alreadySigned) toast(result.message + '，连续' + signed.signStreak + '天');
             } else {
                 rememberSignFailure(result.message);
                 STATE.signMessage = result.message;
@@ -1470,6 +1492,10 @@
     }
     function getSearchItemFid(node) {
         if (!node) return '';
+        if (node.getAttribute) {
+            var savedFid = node.getAttribute('data-shtx-fid');
+            if (savedFid) return savedFid;
+        }
         var fid = '';
         var links = $all('a[href]', node);
         for (var i = 0; i < links.length; i++) {
@@ -1590,9 +1616,9 @@
     function detectMaxPage(root) {
         root = root || document;
         var max = parseInt(getParams().get('page'), 10) || 1;
-        $all('.pg a[href*="page="], a.last[href*="page="]', root).forEach(function(a) {
-            var m = (a.getAttribute('href') || a.href || '').match(/[?&]page=(\d+)/);
-            if (m) max = Math.max(max, parseInt(m[1], 10));
+        $all('.pg a[href], a.last[href]', root).forEach(function(a) {
+            var page = getPageNumberFromHref(a.getAttribute('href') || a.href || '');
+            if (page) max = Math.max(max, page);
         });
         return max || 1;
     }
@@ -1615,7 +1641,8 @@
     }
     function initListTools() {
         STATE.previewVisible = getBool(KEYS.autoPreview, true);
-        if (isListToolPage()) STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, getCurrentPageNumber());
+        if (isNextPageLoadPage()) STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, getCurrentPageNumber());
+        updatePaginationLoadedPage();
         if (!isPreviewToolPage()) return;
         refreshThreads();
         if (getBool(KEYS.autoPreview, true)) loadAllPreviews();
@@ -1641,7 +1668,6 @@
         setListPreviewEnabled(!getBool(KEYS.autoPreview, true));
     }
     function getPreviewToggleText() {
-        if (STATE.previewRunning) return '预览加载中';
         return STATE.previewVisible ? '收起预览' : '展开预览';
     }
     function togglePreviewPanel() {
@@ -1655,7 +1681,7 @@
         setPreviewVisibility(true);
         if (isSearchResultPage()) applySearchFilter();
         refreshThreads();
-        updateListStatus('正在展开预览');
+        updateListStatus('展开预览');
         createToolbar();
         loadAllPreviews().then(function() {
             updateListStatus();
@@ -1936,15 +1962,89 @@
         var page = parseInt(getParams().get('page'), 10);
         return isNaN(page) || page < 1 ? 1 : page;
     }
+    function getLoadedPageNumber() {
+        return Math.max(getCurrentPageNumber(), STATE.loadedMaxPage || 1);
+    }
+    function getPaginationElementPage(el) {
+        if (!el) return 0;
+        var href = el.getAttribute && el.getAttribute('href');
+        if (href) return getPageNumberFromHref(href);
+        var text = textOf(el);
+        return /^\d+$/.test(text) ? (parseInt(text, 10) || 0) : 0;
+    }
+    function updatePaginationLoadedPage() {
+        if (!isNextPageLoadPage()) return;
+        var loaded = getLoadedPageNumber();
+        $all('.pg').forEach(function(pg) {
+            if (isInsideToolUi(pg)) return;
+            $all('.shtx-page-progress', pg).forEach(function(el) { el.remove(); });
+            $all('a, strong, span', pg).forEach(function(el) {
+                var page = getPaginationElementPage(el);
+                el.classList.toggle('shtx-page-current', page === loaded);
+                el.classList.toggle('shtx-page-not-current', !!page && page !== loaded);
+            });
+        });
+    }
+    function getPageNumberFromHref(href) {
+        var value = String(href || '').replace(/&amp;/g, '&');
+        for (var i = 0; i < 3; i++) {
+            var m = value.match(/[?&]page=(\d+)/i) || value.match(/page%3D(\d+)/i);
+            if (m) return parseInt(m[1], 10) || 0;
+            try {
+                var decoded = decodeURIComponent(value);
+                if (decoded === value) break;
+                value = decoded;
+            } catch(e) {
+                break;
+            }
+        }
+        return 0;
+    }
+    function setPageNumberInHref(href, page) {
+        var value = normalizeUrl(href);
+        if (!value) return '';
+        try {
+            var url = new URL(value);
+            if (url.searchParams.has('page')) {
+                url.searchParams.set('page', String(page));
+                return url.href;
+            }
+        } catch(e) {}
+        if (/([?&]page=)\d+/i.test(value)) return value.replace(/([?&]page=)\d+/i, '$1' + page);
+        if (/(page%3D)\d+/i.test(value)) return value.replace(/(page%3D)\d+/i, '$1' + page);
+        return '';
+    }
+    function findPaginationPageUrl(page, root) {
+        root = root || document;
+        var links = $all('.pg a[href], a.last[href]', root);
+        var template = '';
+        for (var i = 0; i < links.length; i++) {
+            var href = links[i].getAttribute('href') || links[i].href || '';
+            var linkPage = getPageNumberFromHref(href);
+            if (linkPage === page) return normalizeUrl(href);
+            if (!template && linkPage) template = href;
+        }
+        return template ? setPageNumberInHref(template, page) : '';
+    }
     function buildNextPageUrl(page) {
         if (isFavoritePage()) return buildListPageUrl(page);
         if (isSearchResultPage()) {
-            var pageLink = $('.pg a[href*="page=' + page + '"], .pg a[href*="page%3D' + page + '"], a[href*="search.php"][href*="page=' + page + '"]');
-            if (pageLink) return normalizeUrl(pageLink.getAttribute('href') || pageLink.href);
+            var pageUrl = findPaginationPageUrl(page, document);
+            if (pageUrl) return pageUrl;
         }
         var url = new URL(location.href);
         url.searchParams.set('page', page);
         return url.href;
+    }
+    function fetchNextPageText(url) {
+        if (!window.AbortController) {
+            return fetch(url, { credentials: 'include' }).then(function(resp) { return resp.text(); });
+        }
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, CONFIG.NEXT_PAGE_TIMEOUT_MS);
+        return fetch(url, { credentials: 'include', signal: controller.signal })
+            .then(function(resp) { return resp.text(); })
+            .finally(function() { clearTimeout(timer); });
     }
     function getUniqueThreadTidsInNode(node) {
         var tids = {};
@@ -2068,8 +2168,80 @@
         }
         return $('#threadlisttableid') || $('#threadlist') || $('.xld') || $('.xl') || document.body;
     }
+    function isAppendCompatible(node, target) {
+        if (!node || !target || !node.tagName || !target.tagName) return true;
+        var nodeTag = node.tagName.toUpperCase();
+        var targetTag = target.tagName.toUpperCase();
+        if (targetTag === 'TABLE') return /^(TBODY|THEAD|TFOOT|TR|CAPTION|COLGROUP)$/.test(nodeTag);
+        if (/^(TBODY|THEAD|TFOOT)$/.test(targetTag)) return nodeTag === 'TR';
+        if (/^(UL|OL)$/.test(targetTag)) return nodeTag === 'LI';
+        if (/^(TBODY|THEAD|TFOOT|TR)$/.test(nodeTag)) return false;
+        if (nodeTag === 'LI') return !/^(TABLE|TBODY|THEAD|TFOOT|TR)$/.test(targetTag);
+        return true;
+    }
+    function getFetchedSearchFid(thread, sourceNode) {
+        if (!isSearchResultPage()) return '';
+        return getSearchItemFid(sourceNode || (thread.link && thread.link.closest && thread.link.closest('tbody, tr, li, dl, .bbda, .pbw')));
+    }
+    function getThreadTidInNode(node) {
+        if (!node || !node.querySelectorAll) return '';
+        var links = node.querySelectorAll('a[href*="viewthread"][href*="tid="], a[href*="thread-"]');
+        for (var i = 0; i < links.length; i++) {
+            var tid = getTidFromHref(links[i].getAttribute('href') || links[i].href);
+            if (tid) return tid;
+        }
+        return '';
+    }
+    function getForumThreadTable(root) {
+        root = root || document;
+        return $('#threadlisttableid', root) || $('table[id*="threadlist"]', root) || $('table[id*="forum"]', root);
+    }
+    function getForumThreadBodies(root) {
+        root = root || document;
+        var bodies = [];
+        $all('#threadlisttableid tbody[id*="thread_"], table[id*="threadlist"] tbody[id*="thread_"], tbody[id*="thread_"]', root).forEach(function(tbody) {
+            var tid = getThreadTidInNode(tbody);
+            if (tid) bodies.push({ tid: tid, node: tbody });
+        });
+        return bodies;
+    }
+    function decorateAutoLoadedNode(node, thread, page, fid) {
+        if (!node || !node.setAttribute) return;
+        node.setAttribute('data-shtx-autoload-page', String(page));
+        node.setAttribute('data-shtx-tid', String(thread.tid || ''));
+        if (fid) node.setAttribute('data-shtx-fid', String(fid));
+        if (node.style) node.style.display = '';
+    }
+    function appendFetchedForumDisplayPage(doc, page, seen) {
+        if (!isForumDisplayPage()) return 0;
+        var target = getForumThreadTable(document);
+        if (!target) return 0;
+        var added = 0;
+        getForumThreadBodies(doc).forEach(function(item) {
+            if (seen[item.tid]) return;
+            seen[item.tid] = true;
+            var clone = item.node.cloneNode(true);
+            $all('script', clone).forEach(function(script) { script.remove(); });
+            $all('.shtx-preview-row, .shtx-preview-block, .shtx-preview-container', clone).forEach(function(el) { el.remove(); });
+            decorateAutoLoadedNode(clone, { tid: item.tid }, page, '');
+            target.appendChild(clone);
+            added++;
+        });
+        return added;
+    }
     function createSimpleThreadNode(thread, page, target) {
-        if (target && /^(TBODY|THEAD|TFOOT)$/.test(target.tagName)) {
+        if (target && /^TABLE$/i.test(target.tagName || '')) {
+            var tbody = document.createElement('tbody');
+            tbody.className = 'shtx-autoload-simple';
+            var tableRow = document.createElement('tr');
+            var tableCell = document.createElement('td');
+            tableCell.colSpan = 8;
+            tableCell.innerHTML = '<a target="_blank" href="' + ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(thread.tid) + '">' + escapeHtml(thread.title) + '</a> <span class="shtx-status">第' + page + '页</span>';
+            tableRow.appendChild(tableCell);
+            tbody.appendChild(tableRow);
+            return tbody;
+        }
+        if (target && /^(TBODY|THEAD|TFOOT)$/i.test(target.tagName || '')) {
             var tr = document.createElement('tr');
             tr.className = 'shtx-autoload-simple';
             var td = document.createElement('td');
@@ -2078,12 +2250,22 @@
             tr.appendChild(td);
             return tr;
         }
+        if (target && /^(UL|OL)$/i.test(target.tagName || '')) {
+            var li = document.createElement('li');
+            li.className = 'shtx-autoload-simple';
+            li.innerHTML = '<a target="_blank" href="' + ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(thread.tid) + '">' + escapeHtml(thread.title) + '</a> <span class="shtx-status">第' + page + '页</span>';
+            return li;
+        }
         var div = document.createElement('div');
         div.className = 'shtx-autoload-simple';
         div.innerHTML = '<a target="_blank" href="' + ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(thread.tid) + '">' + escapeHtml(thread.title) + '</a> <span class="shtx-status">第' + page + '页</span>';
         return div;
     }
     function appendFetchedPageThreads(doc, page, seen) {
+        if (isForumDisplayPage()) {
+            var forumAdded = appendFetchedForumDisplayPage(doc, page, seen);
+            if (forumAdded) return forumAdded;
+        }
         var target = getAppendTarget();
         if (!target) return 0;
         var added = 0;
@@ -2091,15 +2273,17 @@
             if (seen[thread.tid]) return;
             seen[thread.tid] = true;
             var sourceNode = getThreadItemNode(thread.link);
+            var fid = getFetchedSearchFid(thread, sourceNode);
             var clone = null;
             if (sourceNode && sourceNode.cloneNode && sourceNode !== doc.body && sourceNode !== doc.documentElement) {
                 clone = sourceNode.cloneNode(true);
                 $all('script', clone).forEach(function(script) { script.remove(); });
                 $all('.shtx-preview-container', clone).forEach(function(preview) { preview.remove(); });
                 if (!isSingleThreadItemNode(clone, thread.tid)) clone = null;
+                if (clone && !isAppendCompatible(clone, target)) clone = null;
             }
             if (!clone) clone = createSimpleThreadNode(thread, page, target);
-            clone.setAttribute('data-shtx-autoload-page', String(page));
+            decorateAutoLoadedNode(clone, thread, page, fid);
             target.appendChild(clone);
             added++;
         });
@@ -2107,6 +2291,7 @@
         return added;
     }
     function afterNextPagesAppended() {
+        updatePaginationLoadedPage();
         if (isPreviewToolPage()) {
             refreshThreads();
             if (getBool(KEYS.autoPreview, true) && STATE.previewVisible) loadAllPreviews();
@@ -2116,6 +2301,7 @@
     function loadNextFivePages(fromAuto) {
         if (!isNextPageLoadPage()) { toast('当前页面不支持加载后一页'); return; }
         if (STATE.nextPagesLoading) { updateNextStatus('后一页加载中...'); return; }
+        if (fromAuto) markAutoScrollNeedsUserAction();
         STATE.nextPagesLoading = true;
         var basePage = Math.max(getCurrentPageNumber(), STATE.loadedMaxPage || 1);
         var startPage = basePage + 1;
@@ -2132,12 +2318,16 @@
         var seen = {};
         getThreadsWithLinks(document).forEach(function(thread) { seen[thread.tid] = true; });
         var totalAdded = 0;
+        var hadFailure = false;
         function finish(message) {
             STATE.nextPagesLoading = false;
-            updateNextStatus(message);
+            if (fromAuto && totalAdded === 0 && !hadFailure && !isSearchResultPage()) STATE.autoScrollEnd = true;
+            if (getBool(KEYS.autoScrollPages, false) && !STATE.autoScrollEnd) {
+                STATE.autoScrollNeedsUserAction = true;
+                STATE.autoScrollLastTop = getPageScrollTop();
+            }
+            updateNextStatus(totalAdded === 0 && !STATE.autoScrollEnd ? '本次无新增，等待继续滚动' : message);
             afterNextPagesAppended();
-            if (fromAuto && totalAdded === 0) STATE.autoScrollEnd = true;
-            if (getBool(KEYS.autoScrollPages, false) && !STATE.autoScrollEnd) scheduleAutoScrollCheck();
             if (!fromAuto) toast(message);
         }
         function loadPage(page) {
@@ -2146,8 +2336,7 @@
                 return;
             }
             updateNextStatus('加载第 ' + page + ' 页...');
-            fetch(buildNextPageUrl(page), { credentials: 'include' })
-                .then(function(resp) { return resp.text(); })
+            fetchNextPageText(buildNextPageUrl(page))
                 .then(function(html) {
                     var doc = new DOMParser().parseFromString(html, 'text/html');
                     totalAdded += appendFetchedPageThreads(doc, page, seen);
@@ -2155,10 +2344,13 @@
                     afterNextPagesAppended();
                 })
                 .catch(function() {
-                    STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, page);
+                    hadFailure = true;
                     updateNextStatus('第 ' + page + ' 页加载失败，继续下一页');
                 })
-                .then(function() { setTimeout(function() { loadPage(page + 1); }, CONFIG.NEXT_PAGE_DELAY_MS); });
+                .then(function() {
+                    if (page >= endPage) loadPage(page + 1);
+                    else setTimeout(function() { loadPage(page + 1); }, CONFIG.NEXT_PAGE_DELAY_MS);
+                });
         }
         loadPage(startPage);
     }
@@ -2178,13 +2370,71 @@
         setAutoScrollPagesEnabled(!getBool(KEYS.autoScrollPages, false));
     }
 
+    function getPageScrollTop() {
+        var doc = document.documentElement;
+        var body = document.body;
+        return window.pageYOffset || (doc && doc.scrollTop) || (body && body.scrollTop) || 0;
+    }
+
+    function ensureAutoScrollSentinel() {
+        if (!isAutoScrollNextPage() || !document.body) return null;
+        var sentinel = $('#shtx-scroll-sentinel');
+        if (!sentinel) {
+            sentinel = document.createElement('div');
+            sentinel.id = 'shtx-scroll-sentinel';
+            sentinel.setAttribute('aria-hidden', 'true');
+        }
+        if (sentinel.parentNode !== document.body || sentinel !== document.body.lastElementChild) {
+            document.body.appendChild(sentinel);
+        }
+        return sentinel;
+    }
+
+    function markAutoScrollUserAction(force) {
+        if (!isAutoScrollNextPage() || !getBool(KEYS.autoScrollPages, false)) return;
+        if (force) {
+            STATE.autoScrollNeedsUserAction = false;
+            if (isSearchResultPage()) STATE.autoScrollEnd = false;
+        }
+        scheduleAutoScrollCheck();
+    }
+    function scheduleImmediateAutoScrollCheck() {
+        if (!isAutoScrollNextPage() || !getBool(KEYS.autoScrollPages, false)) return;
+        if (STATE.autoScrollTimer) {
+            clearTimeout(STATE.autoScrollTimer);
+            STATE.autoScrollTimer = null;
+        }
+        checkAutoScrollPages();
+    }
+    function handleAutoScrollKey(e) {
+        var key = e && (e.key || e.code);
+        var shouldCheck = key === 'End' || key === 'PageDown' || key === 'Space' || key === 'ArrowDown';
+        if (!shouldCheck) return;
+        markAutoScrollUserAction(true);
+        setTimeout(scheduleImmediateAutoScrollCheck, 30);
+        setTimeout(scheduleImmediateAutoScrollCheck, 140);
+    }
+
+    function markAutoScrollNeedsUserAction() {
+        STATE.autoScrollNeedsUserAction = true;
+        STATE.autoScrollLastTop = getPageScrollTop();
+        STATE.autoScrollLastLoadAt = Date.now();
+        updateNextStatus();
+    }
+
     function isNearPageBottom() {
         var doc = document.documentElement;
         var body = document.body;
-        var scrollTop = window.pageYOffset || doc.scrollTop || body.scrollTop || 0;
+        var scrollTop = getPageScrollTop();
         var viewport = window.innerHeight || doc.clientHeight || 0;
         var height = Math.max(doc.scrollHeight || 0, body.scrollHeight || 0);
-        return height - scrollTop - viewport < 900;
+        var sentinel = ensureAutoScrollSentinel();
+        if (sentinel && sentinel.getBoundingClientRect) {
+            var rect = sentinel.getBoundingClientRect();
+            viewport = window.innerHeight || doc.clientHeight || 0;
+            if (rect.top - viewport < CONFIG.AUTO_SCROLL_BOTTOM_THRESHOLD) return true;
+        }
+        return height - scrollTop - viewport < CONFIG.AUTO_SCROLL_BOTTOM_THRESHOLD;
     }
 
     function scheduleAutoScrollCheck() {
@@ -2193,18 +2443,31 @@
         STATE.autoScrollTimer = setTimeout(function() {
             STATE.autoScrollTimer = null;
             checkAutoScrollPages();
-        }, 250);
+        }, CONFIG.AUTO_SCROLL_DEBOUNCE_MS);
     }
 
     function checkAutoScrollPages() {
         if (!isAutoScrollNextPage() || !getBool(KEYS.autoScrollPages, false)) return;
+        if ($('#shtx-dialog')) return;
         if (STATE.nextPagesLoading || STATE.autoScrollEnd) return;
+        if (STATE.autoScrollNeedsUserAction) return;
+        if (Date.now() - (STATE.autoScrollLastLoadAt || 0) < 1000) return;
         if (isNearPageBottom()) loadNextFivePages(true);
     }
 
     function initAutoScrollPages() {
         if (!isAutoScrollNextPage()) return;
+        ensureAutoScrollSentinel();
         window.addEventListener('scroll', scheduleAutoScrollCheck, { passive: true });
+        document.addEventListener('scroll', scheduleAutoScrollCheck, { passive: true, capture: true });
+        if (document.documentElement) document.documentElement.addEventListener('scroll', scheduleAutoScrollCheck, { passive: true });
+        if (document.body) document.body.addEventListener('scroll', scheduleAutoScrollCheck, { passive: true });
+        window.addEventListener('mousedown', function() { markAutoScrollUserAction(true); }, { passive: true });
+        window.addEventListener('wheel', function() { markAutoScrollUserAction(true); }, { passive: true });
+        window.addEventListener('touchstart', function() { markAutoScrollUserAction(true); }, { passive: true });
+        window.addEventListener('touchend', function() { markAutoScrollUserAction(true); }, { passive: true });
+        window.addEventListener('keydown', handleAutoScrollKey);
+        window.addEventListener('keyup', handleAutoScrollKey);
         window.addEventListener('resize', scheduleAutoScrollCheck);
         if (getBool(KEYS.autoScrollPages, false)) setTimeout(scheduleAutoScrollCheck, 800);
     }
@@ -2392,7 +2655,6 @@
                 if (isThreadPage() && getBool(CONFIG.FULL_IMAGE_KEY, false) && !STATE.fullImageRunning) startFullImageLoad();
                 if (isThreadPage()) scheduleThreadEnhancements();
                 if (isSearchResultPage()) applySearchFilter();
-                if (isAutoScrollNextPage() && getBool(KEYS.autoScrollPages, false)) scheduleAutoScrollCheck();
             }, 700);
         });
         observer.observe(document.body, { childList: true, subtree: true });
