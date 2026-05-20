@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         色花堂统一工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.3.2
-// @description  全局预览、自动签到、收藏/主题页导出、打开页收藏、渐进全图、自动回复、后一页加载
+// @version      1.3.3
+// @description  全局预览、自动签到、帖子收藏评分、收藏/主题页导出、打开页收藏、渐进全图、自动回复、后一页加载
 // @author       米波
 // @match        https://sehuatang.net/*
 // @match        https://www.sehuatang.net/*
@@ -99,6 +99,8 @@
         signRunning: false,
         signAutoStarted: false,
         signMessage: '',
+        threadActionRunning: false,
+        threadActionMessage: '',
     };
 
     function $(selector, root) {
@@ -513,6 +515,10 @@
     function getReplyStatusText() {
         return getBool(KEYS.autoReply, true) ? '开启' : '关闭';
     }
+    function getThreadActionStatusText() {
+        if (STATE.threadActionRunning) return '处理中';
+        return STATE.threadActionMessage || '空闲';
+    }
     function appendStatusLine(toolbar, id, label, value) {
         var row = document.createElement('div');
         row.id = 'shtx-status-' + id;
@@ -575,6 +581,9 @@
 
         if (hasThreadTool) {
             ensureCommonSection();
+            bar.appendChild(makeButton('收藏本帖', 'blue', favoriteCurrentThread));
+            bar.appendChild(makeButton('评分', 'orange', rateCurrentThread));
+            bar.appendChild(makeButton('一键二连', 'red', twoActionCurrentThread));
             bar.appendChild(makeButton('停止全图', 'gray', function() { stopFullImageLoad(); createToolbar(); updateFullImageStatus('已停止本页'); }));
         }
 
@@ -602,6 +611,7 @@
         }
 
         if (hasThreadTool) {
+            appendStatusLine(bar, 'thread-action', '帖子操作', getThreadActionStatusText());
             appendStatusLine(bar, 'full-image', '全图加载', getFullImageStatusText());
             appendStatusLine(bar, 'full-message', '图片', STATE.fullImageRunning ? '处理中' : '空闲');
         }
@@ -638,6 +648,10 @@
     }
     function updateOpenStatus() {
         setStatusLine('open-count', getOpenThreads().length + ' 个');
+    }
+    function updateThreadActionStatus(message) {
+        if (message) STATE.threadActionMessage = message;
+        setStatusLine('thread-action', getThreadActionStatusText());
     }
     function updateSignStatus(message) {
         if (message) STATE.signMessage = message;
@@ -1024,6 +1038,182 @@
         }).catch(function(e) {
             progress.textContent = e.message || '批量收藏失败';
             toast(progress.textContent, 'error');
+        });
+    }
+
+    // ---------------- 帖子页收藏 / 评分 ----------------
+    function parseFirstInteger(text) {
+        var m = String(text || '').replace(/,/g, '').match(/[+-]?\d+/);
+        return m ? parseInt(m[0], 10) : NaN;
+    }
+    function getFirstPostPidFromDocument(root) {
+        var node = $('table[id^="pid"]', root);
+        if (!node || !node.id) return '';
+        return node.id.replace(/^pid/, '');
+    }
+    function buildFirstThreadPageUrl() {
+        var url = new URL(location.href);
+        url.searchParams.set('mod', 'viewthread');
+        url.searchParams.set('tid', getTid());
+        url.searchParams.set('page', '1');
+        return url.href;
+    }
+    function getCurrentThreadFirstPid() {
+        var localPid = getFirstPostPidFromDocument(document);
+        if (localPid && getCurrentPageNumber() === 1) return Promise.resolve(localPid);
+        if (!getTid()) return Promise.resolve('');
+        return fetch(buildFirstThreadPageUrl(), { credentials: 'include' })
+            .then(function(resp) { return resp.text(); })
+            .then(function(html) {
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                return getFirstPostPidFromDocument(doc);
+            })
+            .catch(function() { return ''; });
+    }
+    function favoriteCurrentThreadRequest() {
+        var tid = getTid();
+        if (!tid) return Promise.resolve({ state: 'error', label: '未识别到当前帖子' });
+        return getFormhash().then(function(formhash) {
+            if (!formhash) return { state: 'error', label: '无法获取 formhash，请确认已登录' };
+            return favoriteThread(tid, formhash).then(function(result) {
+                if (result.state === 'success') return { state: 'success', label: '本帖收藏成功' };
+                if (result.state === 'exists') return { state: 'exists', label: '本帖已收藏' };
+                return result;
+            });
+        }).catch(function() {
+            return { state: 'error', label: '收藏请求失败' };
+        });
+    }
+    function getRateInfo(pid, tid) {
+        var url = ORIGIN + '/forum.php?mod=misc&action=rate&tid=' + encodeURIComponent(tid) +
+            '&pid=' + encodeURIComponent(pid) +
+            '&infloat=yes&handlekey=rate&t=' + Date.now() +
+            '&inajax=1&ajaxtarget=fwin_content_rate';
+        return fetch(url, { credentials: 'include' })
+            .then(function(resp) { return resp.text(); })
+            .then(function(text) {
+                var html = parseSignAjaxHtml(text);
+                var plain = htmlToPlainText(html);
+                if (/请先登录|登录后|您需要登录/.test(plain)) return { state: false, error: '需要登录后才能评分' };
+                if (/抱歉|不能对同一个帖子重复评分|对自己发表的帖子评分|重复评分|自己发表/.test(plain)) {
+                    return { state: false, error: '不能重复评分，或不能给自己的帖子评分' };
+                }
+
+                var doc = new DOMParser().parseFromString(html, 'text/html');
+                var scoreOption = $('#scoreoption8 li', doc);
+                var leftCell = $('.dt.mbm td:last-child', doc);
+                var formhash = $('input[name="formhash"]', doc);
+                if (!scoreOption || !formhash) return { state: false, error: '获取评分信息失败' };
+
+                var max = parseFirstInteger(textOf(scoreOption));
+                var left = leftCell ? parseFirstInteger(textOf(leftCell)) : NaN;
+                if (!isNaN(left)) max = Math.min(max, left);
+                if (isNaN(max) || max <= 0) return { state: false, error: '今日可评分额度不足' };
+
+                var referer = $('input[name="referer"]', doc);
+                var handlekey = $('input[name="handlekey"]', doc);
+                return {
+                    state: true,
+                    max: max,
+                    formhash: formhash.value,
+                    referer: referer ? referer.value : '',
+                    handlekey: handlekey ? handlekey.value : 'rate',
+                };
+            })
+            .catch(function() {
+                return { state: false, error: '获取评分信息失败' };
+            });
+    }
+    function submitRate(tid, pid, rateInfo) {
+        var data = new URLSearchParams();
+        data.append('formhash', rateInfo.formhash);
+        data.append('tid', tid);
+        data.append('pid', pid);
+        data.append('referer', rateInfo.referer || location.href);
+        data.append('handlekey', rateInfo.handlekey || 'rate');
+        data.append('score8', '+' + rateInfo.max);
+        data.append('reason', '');
+        data.append('sendreasonpm', 'on');
+        return fetch(ORIGIN + '/forum.php?mod=misc&action=rate&ratesubmit=yes&infloat=yes&inajax=1', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: data,
+        }).then(function(resp) {
+            return resp.text();
+        }).then(function(text) {
+            var plain = htmlToPlainText(parseSignAjaxHtml(text));
+            if (/感谢您的参与|评分成功|成功评分/.test(plain)) {
+                return { state: 'success', label: '+' + rateInfo.max + ' 评分成功，已通知作者', score: rateInfo.max };
+            }
+            if (/重复评分|不能对同一个帖子重复评分|自己发表/.test(plain)) {
+                return { state: 'error', label: '不能重复评分，或不能给自己的帖子评分' };
+            }
+            if (/请先登录|登录后|您需要登录/.test(plain)) return { state: 'error', label: '需要登录后才能评分' };
+            return { state: 'error', label: '评分失败' };
+        }).catch(function() {
+            return { state: 'error', label: '评分请求失败' };
+        });
+    }
+    function rateCurrentThreadRequest() {
+        var tid = getTid();
+        if (!tid) return Promise.resolve({ state: 'error', label: '未识别到当前帖子' });
+        return getCurrentThreadFirstPid().then(function(pid) {
+            if (!pid) return { state: 'error', label: '未识别到帖子楼主 pid' };
+            return getRateInfo(pid, tid).then(function(info) {
+                if (!info.state) return { state: 'error', label: info.error || '获取评分信息失败' };
+                return submitRate(tid, pid, info);
+            });
+        }).catch(function() {
+            return { state: 'error', label: '评分请求失败' };
+        });
+    }
+    function beginThreadAction(message) {
+        if (!isThreadPage()) {
+            toast('当前页面不是帖子页', 'error');
+            return false;
+        }
+        if (STATE.threadActionRunning) {
+            toast('帖子操作正在处理中');
+            return false;
+        }
+        STATE.threadActionRunning = true;
+        STATE.threadActionMessage = message || '处理中';
+        createToolbar();
+        updateThreadActionStatus();
+        return true;
+    }
+    function finishThreadAction(message, type) {
+        STATE.threadActionRunning = false;
+        STATE.threadActionMessage = message || '空闲';
+        createToolbar();
+        updateThreadActionStatus();
+        if (message) toast(message, type);
+    }
+    function favoriteCurrentThread() {
+        if (!beginThreadAction('收藏中')) return;
+        favoriteCurrentThreadRequest().then(function(result) {
+            finishThreadAction(result.label, result.state === 'error' ? 'error' : null);
+        });
+    }
+    function rateCurrentThread() {
+        if (!beginThreadAction('评分中')) return;
+        rateCurrentThreadRequest().then(function(result) {
+            finishThreadAction(result.label, result.state === 'error' ? 'error' : null);
+        });
+    }
+    function twoActionCurrentThread() {
+        if (!beginThreadAction('一键二连中')) return;
+        favoriteCurrentThreadRequest().then(function(favoriteResult) {
+            return rateCurrentThreadRequest().then(function(rateResult) {
+                return { favorite: favoriteResult, rate: rateResult };
+            });
+        }).then(function(result) {
+            var failed = result.favorite.state === 'error' || result.rate.state === 'error';
+            var prefix = failed ? '一键二连部分失败：' : '一键二连完成：';
+            finishThreadAction(prefix + result.favorite.label + '，' + result.rate.label, failed ? 'error' : null);
+        }).catch(function() {
+            finishThreadAction('一键二连失败', 'error');
         });
     }
 
