@@ -9,6 +9,8 @@
 // @match        https://sehuatang.org/*
 // @match        https://www.sehuatang.org/*
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @run-at       document-end
 // ==/UserScript==
 
@@ -26,6 +28,10 @@
         ALL_PAGES: 120,
         EXPORT_DELAY_MS: 200,
         EXPORT_CONCURRENCY: 3,
+        ATTACH_PARSE_CONCURRENCY: 2,
+        ATTACH_TEXT_MAX: 2 * 1024 * 1024,
+        ATTACH_ZIP_MAX: 20 * 1024 * 1024,
+        ATTACH_TIMEOUT_MS: 30000,
 
         AUTO_SIGN_KEY: 'sht_auto_sign_enabled',
         AUTO_SIGN_STATE_KEY: 'sht_auto_sign_state',
@@ -1397,46 +1403,371 @@
     function openExportDialog() {
         refreshThreads(); var threads = getThreadsWithLinks(document); if (threads.length === 0) { toast('当前页没有主题'); return; }
         var dlg = createDialog('导出资源链接', '520px');
-        dlg.body.innerHTML = '<div class="shtx-row"><label>输出格式：</label><select id="shtx-export-format" class="shtx-select" style="flex:1;"><option value="full">标题 + 链接</option><option value="url">纯链接</option><option value="csv">CSV</option></select></div>' +
-            '<div class="shtx-row"><label>输出方式：</label><select id="shtx-export-mode" class="shtx-select" style="flex:1;"><option value="copy">复制到剪贴板</option><option value="download">下载文件</option></select></div>' +
+        dlg.body.innerHTML = '<div class="shtx-settings-note">将打开每个帖子提取 ed2k/magnet 链接并下载解析 txt/zip 附件。文本附件 &le;2MB，ZIP &le;20MB。r ar/ 7z 会标记为未解析。</div>' +
             '<div class="shtx-status">当前页 ' + threads.length + ' 个主题</div>';
         var progress = document.createElement('div'); progress.className = 'shtx-status'; dlg.foot.appendChild(progress);
         var cancelled = false;
-        dlg.foot.appendChild(makeBtn('开始导出', 'green', function() {
-            var btn = dlg.foot.querySelector('.shtx-green'); if (btn.disabled) return; btn.disabled = true; btn.textContent = '导出中...';
-            var format = $('#shtx-export-format').value, mode = $('#shtx-export-mode').value;
-            runExport(threads, format, progress, function(text) {
+        var startBtn = makeBtn('导出 CSV', 'green', function() {
+            if (startBtn.disabled) return; startBtn.disabled = true; startBtn.textContent = '导出中...';
+            runExport(threads, progress, function(text) {
                 var ts = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-                if (mode === 'copy') copyToClipboard(text); else downloadAsFile(text, 'sehuatang_export_' + ts + (format === 'csv' ? '.csv' : '.txt'), format === 'csv' ? 'text/csv;charset=utf-8' : undefined);
-                progress.textContent = '已完成'; btn.textContent = '已完成';
+                downloadAsFile(text, 'sehuatang_export_' + ts + '.csv', 'text/csv;charset=utf-8');
+                progress.textContent = '已完成'; startBtn.textContent = '已完成';
             }, function() { return cancelled; });
-        }));
+        });
+        dlg.foot.appendChild(startBtn);
         dlg.foot.appendChild(makeBtn('停止', 'gray', function() { cancelled = true; }));
     }
-    function extractResourceLinks(tid, title) { return fetch(ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(tid), { credentials: 'include' }).then(function(r) { return r.text(); }).then(function(html) { return extractResourcesFromHtml(html, tid, title); }).catch(function() { return { title: title, tid: tid, ed2k: [], magnet: [], attachments: [], error: '加载失败' }; }); }
+
+    function extractResourceLinks(tid, title) {
+        var url = ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(tid);
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, CONFIG.ATTACH_TIMEOUT_MS);
+        return fetch(url, { credentials: 'include', signal: controller.signal }).then(function(r) {
+            return r.text();
+        }).then(function(html) {
+            clearTimeout(timer);
+            return extractResourcesFromHtml(html, tid, title);
+        }).catch(function(e) {
+            clearTimeout(timer);
+            return { title: title, tid: tid, url: url, links: [], attachments: [], exportOk: false, errors: ['页面加载失败: ' + (e.name === 'AbortError' ? '超时' : (e.message || ''))] };
+        });
+    }
+
     function extractResourcesFromHtml(html, tid, title) {
-        var r = { title: title, tid: tid, ed2k: [], magnet: [], attachments: [] }, match;
-        var er = /ed2k:\/\/\|file\|[^\n"<>]+/g; while ((match = er.exec(html)) !== null) addUnique(r.ed2k, match[0].replace(/&amp;/g, '&').trim());
-        var mr = /magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^"<\s]*/g; while ((match = mr.exec(html)) !== null) addUnique(r.magnet, match[0].replace(/&amp;/g, '&').trim());
-        var ar = /<a[^>]*?href\s*=\s*["']([^"']*forum\.php\?mod=attachment(?:&|&amp;)aid=\d+[^"']*)["'][^>]*?>/gi, sa = {};
-        while ((match = ar.exec(html)) !== null) { var href = match[1].replace(/&amp;/g, '&'); var fu = /^https?:\/\//i.test(href) ? href : ORIGIN + '/' + href.replace(/^\//, ''); if (sa[fu]) continue; sa[fu] = true; var nm = match[0].match(/>([^<]+)</); var name = nm ? nm[1].replace(/\s+/g, ' ').trim() : '附件'; if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(name)) continue; r.attachments.push({ url: fu, name: name }); }
+        var r = { title: title, tid: tid, url: ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(tid), links: [], attachments: [], exportOk: true, errors: [] };
+        var match;
+        var cleanHtml = html.replace(/&#124;/g, '|').replace(/%7C/g, '|');
+        var er = /ed2k:\/\/\|file\|[^\n\r"<>]+/gi;
+        while ((match = er.exec(cleanHtml)) !== null) addUniqueLink(r.links, match[0].replace(/&amp;/g, '&').trim(), 'ED2K', '正文');
+        var mr = /magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^\s"<>]*/gi;
+        while ((match = mr.exec(cleanHtml)) !== null) addUniqueLink(r.links, match[0].replace(/&amp;/g, '&').trim(), 'Magnet', '正文');
+        var doc = new DOMParser().parseFromString(html, 'text/html');
+        var attachLinks = doc.querySelectorAll('a[href*="mod=attachment"], a[href*="aid="]');
+        var sa = {};
+        if (!attachLinks.length) {
+            var ar = /<a[^>]*href\s*=\s*["']([^"']*(?:mod=attachment|aid=\d+)[^"']*)["'][^>]*>([^<]*)<\/a>/gi;
+            var rm;
+            while ((rm = ar.exec(html)) !== null) {
+                var hrf = rm[1].replace(/&amp;/g, '&');
+                var fu2; try { fu2 = new URL(hrf, ORIGIN).href; } catch(e2) { fu2 = ORIGIN + '/' + hrf.replace(/^\//, ''); }
+                if (sa[fu2]) continue; sa[fu2] = true;
+                var aname = rm[2].replace(/\s+/g, ' ').trim();
+                if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(aname)) continue;
+                r.attachments.push({ url: fu2, name: aname || '附件', status: 'pending' });
+            }
+            return r;
+        }
+        each(attachLinks, function(a) {
+            var rawHref = (a.href || a.getAttribute('href') || '').replace(/&amp;/g, '&');
+            if (!/forum\.php\?mod=attachment/i.test(rawHref)) return;
+            var fu = /^https?:\/\//i.test(rawHref) ? rawHref : (ORIGIN + '/' + rawHref.replace(/^\//, ''));
+            if (sa[fu]) return; sa[fu] = true;
+            var name = (a.textContent || a.innerText || '').replace(/\s+/g, ' ').trim();
+            if (!name || name === '附件' || name === '下载附件') {
+                var parent = a.closest('dl, p, span, div, td');
+                if (parent) {
+                    var parentText = (parent.textContent || parent.innerText || '').replace(/\s+/g, ' ').trim();
+                    var extMatch = parentText.match(/(\S+\.(txt|url|zip|rar|7z))/i);
+                    if (extMatch) name = extMatch[1];
+                    if (!name || name === a.textContent.trim()) {
+                        var before = parentText.substring(0, parentText.indexOf(a.textContent.trim()));
+                        var beforeMatch = before.match(/(\S+\.\w{2,4})\s*$/);
+                        if (beforeMatch) name = beforeMatch[1];
+                    }
+                }
+            }
+            if (!name || name === '附件') name = a.getAttribute('title') || '';
+            if (!name || name === '附件') name = '附件';
+            if (/\.(jpg|jpeg|png|gif|webp|bmp)$/i.test(name)) return;
+            r.attachments.push({ url: fu, name: name, status: 'pending' });
+        });
         return r;
     }
-    function addUnique(list, value) { if (value && list.indexOf(value) === -1) list.push(value); }
-    function csvEscape(value) { return '"' + String(value == null ? '' : value).replace(/"/g, '""') + '"'; }
-    function formatResources(results, format) {
-        var lines = [], index = 0; if (format === 'csv') lines.push('标题,链接类型,链接');
-        results.forEach(function(r) { var links = []; r.ed2k.forEach(function(u) { links.push({ type: 'ED2K', url: u }); }); r.magnet.forEach(function(u) { links.push({ type: 'Magnet', url: u }); }); r.attachments.forEach(function(a) { links.push({ type: '附件', url: a.url, name: a.name }); });
-            if (links.length === 0) { if (format === 'url') return; if (format === 'csv') lines.push([csvEscape(r.title), csvEscape('无链接'), csvEscape('')].join(',')); else lines.push((++index) + '. ' + r.title + '\n   ' + (r.error ? '[加载失败]' : '[无链接]')); return; }
-            if (format === 'url') links.forEach(function(l) { lines.push(l.url); }); else if (format === 'csv') links.forEach(function(l) { lines.push([csvEscape(r.title), csvEscape(l.type + (l.name ? '(' + l.name + ')' : '')), csvEscape(l.url)].join(',')); }); else lines.push((++index) + '. ' + r.title + '\n' + links.map(function(l) { return '  [' + l.type + (l.name ? ': ' + l.name : '') + '] ' + l.url; }).join('\n'));
+
+    function parseAttachment(attachment, onProgress) {
+        var name = (attachment.name || '').toLowerCase();
+        var isText = /\.(txt|url)$/i.test(name);
+        var isZip = /\.zip$/i.test(name);
+        var isUnsupported = /\.(rar|7z)$/i.test(name);
+        var isUnknown = !isText && !isZip && !isUnsupported;
+        if (isUnsupported) { attachment.status = 'unsupported'; attachment.error = '格式不支持'; return Promise.resolve({ ok: false, reason: 'unsupported' }); }
+        var maxSize = isZip || isUnknown ? CONFIG.ATTACH_ZIP_MAX : CONFIG.ATTACH_TEXT_MAX;
+        return downloadWithCheck(attachment.url, maxSize, function(size) {
+            onProgress('下载 ' + name + ' ' + formatSize(size));
+        }).then(function(result) {
+            if (!result.blob) { attachment.status = 'error'; attachment.error = result.error || '下载失败'; return { ok: false, reason: 'download' }; }
+            if (result.filename && isUnknown) {
+                var newName = result.filename.toLowerCase();
+                isText = /\.(txt|url)$/i.test(newName);
+                isZip = /\.zip$/i.test(newName);
+                isUnsupported = /\.(rar|7z)$/i.test(newName);
+                if (isText || isZip || isUnsupported) { attachment.name = result.filename; name = newName; }
+            }
+            if (isUnknown && result.contentType) {
+                var ct = result.contentType.toLowerCase();
+                if (/text\/|json|xml|javascript|x-www-form-urlencoded/.test(ct)) isText = true;
+                else if (/zip|compressed/.test(ct)) isZip = true;
+            }
+            if (isUnsupported) { attachment.status = 'unsupported'; attachment.error = '格式不支持'; return { ok: false, reason: 'unsupported' }; }
+            if (isText) return parseTextContent(result.blob, attachment.name).then(function(links) {
+                attachment.links = links;
+                if (!links.length) {
+                    attachment.status = 'no-links'; attachment.error = '未识别到资源链接';
+                    return { ok: false, reason: 'no-links', links: [] };
+                }
+                attachment.status = 'parsed'; return { ok: true, links: links, source: '附件: ' + attachment.name };
+            });
+            if (isZip) return parseZipContent(result.blob, attachment.name, onProgress).then(function(zr) {
+                var links = zr.links || []; var errors = zr.errors || [];
+                attachment.status = errors.length ? 'error' : 'parsed'; attachment.links = links;
+                if (errors.length) attachment.error = '无法读取: ' + errors.join(', ');
+                if (!errors.length && !links.length) { attachment.status = 'no-links'; attachment.error = '未识别到资源链接'; return { ok: false, reason: 'no-links', links: [] }; }
+                return { ok: !errors.length, links: links, source: '压缩包: ' + attachment.name };
+            }).catch(function(e) {
+                attachment.status = 'error'; attachment.error = e.message || '解压失败'; return { ok: false, reason: 'zip-error' };
+            });
+            if (result.blob.size <= CONFIG.ATTACH_TEXT_MAX) {
+                return parseTextContent(result.blob, attachment.name).then(function(links) {
+                    attachment.links = links;
+                    if (links.length) {
+                        attachment.status = 'parsed';
+                        attachment.error = '';
+                        return { ok: true, links: links, source: '附件: ' + attachment.name + '（按文本识别）' };
+                    }
+                    attachment.status = 'no-links';
+                    attachment.error = '未知附件格式或未识别到资源链接';
+                    return { ok: false, reason: 'no-links', links: [] };
+                });
+            }
+            attachment.status = 'skipped'; attachment.error = '未知附件格式';
+            return { ok: false, reason: 'skipped' };
         });
-        return lines.join('\n');
     }
-    function runExport(threads, format, progress, done, isCancelled) {
+
+    function downloadWithCheck(url, maxSize, onSize) {
+        return new Promise(function(resolve) {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                resolve({ blob: null, error: 'GM_xmlhttpRequest不可用' }); return;
+            }
+            var buffer = null, totalSize = 0;
+            var timedOut = false;
+            var timer = setTimeout(function() {
+                timedOut = true;
+                resolve({ blob: null, error: '下载超时' });
+            }, CONFIG.ATTACH_TIMEOUT_MS);
+            GM_xmlhttpRequest({
+                method: 'GET', url: url, responseType: 'arraybuffer',
+                timeout: CONFIG.ATTACH_TIMEOUT_MS, anonymous: false,
+                headers: { 'Referer': location.href, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8' },
+                onload: function(resp) {
+                    if (timedOut) return; clearTimeout(timer);
+                    if (resp.status === 401 || resp.status === 403) { resolve({ blob: null, error: '权限不足' }); return; }
+                    if (resp.status < 200 || resp.status >= 300) { resolve({ blob: null, error: 'HTTP ' + resp.status }); return; }
+                    buffer = resp.response;
+                    if (!buffer || buffer.byteLength === 0) { resolve({ blob: null, error: '空内容' }); return; }
+                    if (buffer.byteLength > maxSize) { resolve({ blob: null, error: '附件过大' }); return; }
+                    var contentType = (resp.responseHeaders || '').match(/content-type:\s*([^\r\n]+)/i);
+                    var ct = contentType ? contentType[1] : '';
+                    if (ct.indexOf('text/html') !== -1 && resp.finalUrl && resp.finalUrl.indexOf('login') !== -1) {
+                        resolve({ blob: null, error: '需要登录' }); return;
+                    }
+                    var disposition = (resp.responseHeaders || '').match(/content-disposition:\s*([^\r\n]+)/i);
+                    var cdName = '';
+                    if (disposition) {
+                        var cdText = disposition[1];
+                        var cdStar = cdText.match(/filename\*\s*=\s*(?:UTF-8''|GBK''|GB2312'')?([^;\n]+)/i);
+                        var cdMatch = cdText.match(/filename\s*=\s*['"]?([^'"\n;]*)['"]?/i);
+                        cdName = cdStar ? cdStar[1] : (cdMatch ? cdMatch[1] : '');
+                        cdName = cdName.replace(/["']/g, '').trim();
+                        try { cdName = decodeURIComponent(cdName); } catch(e) {}
+                    }
+                    var blob = new Blob([buffer]);
+                    resolve({ blob: blob, error: '', filename: cdName, contentType: ct, finalUrl: resp.finalUrl || url });
+                },
+                onerror: function() { if (!timedOut) { clearTimeout(timer); resolve({ blob: null, error: '网络错误' }); } },
+                ontimeout: function() { if (!timedOut) { clearTimeout(timer); timedOut = true; resolve({ blob: null, error: '下载超时' }); } },
+                onprogress: function(e) { if (onSize && e.lengthComputable) onSize(e.loaded); }
+            });
+        });
+    }
+
+    function parseTextContent(blob, sourceName) {
+        return new Promise(function(resolve) {
+            var reader = new FileReader();
+            reader.onload = function() { resolve(extractLinksFromText(reader.result, sourceName)); };
+            reader.onerror = function() { resolve([]); };
+            reader.readAsText(blob);
+        });
+    }
+
+    function extractLinksFromText(text, sourceName) {
+        var links = [], match;
+        var er = /ed2k:\/\/\|file\|[^\n\r<>"]+/gi;
+        while ((match = er.exec(text)) !== null) addUniqueLink(links, match[0].trim(), 'ED2K', sourceName);
+        var mr = /magnet:\?xt=urn:btih:[a-zA-Z0-9]{32,40}[^\s"<>]*/gi;
+        while ((match = mr.exec(text)) !== null) addUniqueLink(links, match[0].trim(), 'Magnet', sourceName);
+        return links;
+    }
+
+    function parseZipContent(blob, zipName, onProgress) {
+        return new Promise(function(resolve, reject) {
+            if (typeof JSZip === 'undefined') { reject(new Error('JSZip未加载')); return; }
+            if (blob.size > CONFIG.ATTACH_ZIP_MAX) { reject(new Error('ZIP过大')); return; }
+            JSZip.loadAsync(blob).then(function(zip) {
+                var textExts = /\.(txt|url|html|htm|nfo|md)$/i;
+                var files = [];
+                zip.forEach(function(relativePath, file) {
+                    if (!file.dir && textExts.test(file.name)) files.push(file);
+                });
+                if (!files.length) { resolve({ links: [], errors: [] }); return; }
+                var links = [], zipErrors = [];
+                function next(i) {
+                    if (i >= files.length) { resolve({ links: links, errors: zipErrors }); return; }
+                    var f = files[i];
+                    if (onProgress) onProgress('解压 ' + f.name);
+                    f.async('text').then(function(content) {
+                        var source = zipName + '/' + f.name;
+                        links = links.concat(extractLinksFromText(content, source));
+                        next(i + 1);
+                    }).catch(function() {
+                        zipErrors.push(f.name);
+                        next(i + 1);
+                    });
+                }
+                next(0);
+            }).catch(function(e) { reject(new Error('ZIP解压失败')); });
+        });
+    }
+
+    function addUniqueLink(list, url, type, source) {
+        if (!url) return;
+        for (var i = 0; i < list.length; i++) { if (list[i].url === url) return; }
+        list.push({ type: type, url: url, source: source || '正文' });
+    }
+
+    function csvEscape(value) {
+        return '"' + String(value == null ? '' : value).replace(/"/g, '""') + '"';
+    }
+
+    function formatSize(bytes) {
+        if (bytes < 1024) return bytes + 'B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + 'KB';
+        return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+    }
+
+    function addUniqueError(list, message) {
+        if (!message) return;
+        if (list.indexOf(message) === -1) list.push(message);
+    }
+
+    function attachmentFailureReason(a) {
+        if (!a) return '附件解析失败';
+        if (a.error) return a.error;
+        if (a.status === 'unsupported') return '格式不支持';
+        if (a.status === 'skipped') return '未知附件格式';
+        if (a.status === 'no-links') return '未识别到资源链接';
+        if (a.status === 'pending') return '未完成解析';
+        if (a.status === 'error') return '解析失败';
+        return '';
+    }
+
+    function finalizeExportResult(r) {
+        r.links = r.links || [];
+        r.attachments = r.attachments || [];
+        r.errors = r.errors || [];
+        r.unresolvedAttachments = [];
+        r.attachments.forEach(function(a) {
+            if (a.status === 'parsed') return;
+            var reason = attachmentFailureReason(a);
+            r.unresolvedAttachments.push({ name: a.name || '附件', url: a.url || '', status: a.status || 'unknown', error: reason });
+        });
+        if (!r.links.length) addUniqueError(r.errors, '未导出资源链接');
+        if (r.unresolvedAttachments.length) addUniqueError(r.errors, '存在未完整解析的附件');
+        r.exportOk = r.links.length > 0 && r.errors.length === 0 && r.unresolvedAttachments.length === 0;
+        return r;
+    }
+
+    function formatResources(results) {
+        var lines = ['帖子名称,资源链接,状态,来源,说明'];
+        results.forEach(function(r) {
+            if (r.links && r.links.length) {
+                r.links.forEach(function(l) {
+                    lines.push([csvEscape(r.title), csvEscape(l.url), csvEscape('成功'), csvEscape(l.source || l.type || '正文'), csvEscape('')].join(','));
+                });
+            }
+            if (r.unresolvedAttachments && r.unresolvedAttachments.length) {
+                r.unresolvedAttachments.forEach(function(a) {
+                    lines.push([csvEscape(r.title), csvEscape(a.url || ''), csvEscape('导出失败'), csvEscape('附件: ' + a.name), csvEscape(a.error || '附件未完整解析')].join(','));
+                });
+            }
+            if (r.errors && r.errors.length) {
+                r.errors.forEach(function(e) {
+                    lines.push([csvEscape(r.title), csvEscape(''), csvEscape('导出失败'), csvEscape('帖子'), csvEscape(e)].join(','));
+                });
+            }
+        });
+        return '﻿' + lines.join('\n');
+    }
+
+    function runExport(threads, progress, done, isCancelled) {
         var results = [], nextIndex = 0, finished = 0, stopped = false;
+        var parseQueue = [], parsing = 0;
         function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
-        function worker() { if (isCancelled()) { stopped = true; return Promise.resolve(); } var i = nextIndex++; if (i >= threads.length) return Promise.resolve(); var start = Date.now(); progress.textContent = '处理 (' + (finished + 1) + '/' + threads.length + ')：' + threads[i].title.substring(0, 42); return extractResourceLinks(threads[i].tid, threads[i].title).then(function(r) { results[i] = r; finished++; }).then(function() { return wait(Math.max(0, CONFIG.EXPORT_DELAY_MS - (Date.now() - start))); }).then(worker); }
-        Promise.all(Array.from({ length: Math.min(CONFIG.EXPORT_CONCURRENCY, threads.length) }, worker)).then(function() { if (stopped || isCancelled()) { progress.textContent = '已停止'; return; } done(formatResources(results.filter(Boolean), format)); });
+        function runParseQueue() {
+            while (parsing < CONFIG.ATTACH_PARSE_CONCURRENCY && parseQueue.length > 0) {
+                (function(item) {
+                    parsing++;
+                    var done = false;
+                    var tid = setTimeout(function() {
+                        if (done) return;
+                        done = true; parsing--; item.att.status = 'error'; item.att.error = '解析超时'; runParseQueue();
+                    }, CONFIG.ATTACH_TIMEOUT_MS);
+                    parseAttachment(item.att, function(msg) { progress.textContent = msg; }).then(function(result) {
+                        if (done) return;
+                        done = true; clearTimeout(tid);
+                        if (result.links) {
+                            result.links.forEach(function(l) { addUniqueLink(item.result.links, l.url, l.type, l.source); });
+                        }
+                        parsing--; runParseQueue();
+                    });
+                })(parseQueue.shift());
+            }
+        }
+        function worker() {
+            if (stopped || isCancelled()) { stopped = true; return Promise.resolve(); }
+            var i = nextIndex++; if (i >= threads.length) return Promise.resolve();
+            var start = Date.now();
+            progress.textContent = '帖子 ' + (finished + 1) + '/' + threads.length + '：' + threads[i].title.substring(0, 40);
+            return extractResourceLinks(threads[i].tid, threads[i].title).then(function(r) {
+                results[i] = r; finished++;
+                if (r.attachments && r.attachments.length) {
+                    r.attachments.forEach(function(att) { parseQueue.push({ result: r, att: att }); });
+                    runParseQueue();
+                }
+            }).then(function() {
+                return wait(Math.max(0, CONFIG.EXPORT_DELAY_MS - (Date.now() - start)));
+            }).then(worker);
+        }
+        var count = Math.min(CONFIG.EXPORT_CONCURRENCY, threads.length);
+        Promise.all(Array.from({ length: count }, worker)).then(function() {
+            var pollStart = Date.now();
+            function pollParse() {
+                if (stopped || isCancelled()) { progress.textContent = '已停止'; return; }
+                if (parseQueue.length > 0 || parsing > 0) {
+                    if (Date.now() - pollStart > 60000) {
+                        parseQueue.length = 0; parsing = 0;
+                        progress.textContent = '附件解析超时，正在生成文件...';
+                    } else { setTimeout(pollParse, 200); return; }
+                }
+                var finalResults = results.filter(Boolean).map(finalizeExportResult);
+                var okCount = finalResults.filter(function(r) { return r.exportOk; }).length;
+                var failCount = finalResults.length - okCount;
+                done(formatResources(finalResults));
+                appendTaskLog('export', '导出完成', '成功 ' + okCount + '，失败 ' + failCount);
+            }
+            pollParse();
+        });
     }
 
     // ============ MUTATION OBSERVER ============
