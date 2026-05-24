@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.0.0
+// @version      1.0.2
 // @description  自动签到、无缝翻页、图片预览、板块筛选、帖子操作、自动回复、批量收藏、资源导出
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -325,9 +325,12 @@
             '.shtx-result-row{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px;}' +
             '.shtx-result-row a{color:#e74c3c;text-decoration:none;flex:1;word-break:break-all;line-height:1.4;}' +
             '.shtx-code-copy{margin:4px 0 6px;padding:3px 8px;background:#3498db;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:12px;}' +
-            '.shtx-filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(128px,1fr));gap:6px 10px;margin:8px 0 10px;}' +
-            '.shtx-filter-item{display:flex;align-items:center;gap:6px;color:#333;font-size:12px;white-space:nowrap;}' +
-            '.shtx-filter-item input{accent-color:#e74c3c;}' +
+            '.shtx-filter-actions{display:flex;align-items:center;gap:8px;margin:0 0 10px;flex-wrap:wrap;}' +
+            '.shtx-filter-list{max-height:52vh;overflow:auto;border:1px solid #eee;border-radius:6px;background:#fafafa;padding:8px;box-sizing:border-box;}' +
+            '.shtx-filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 10px;margin:0;}' +
+            '.shtx-filter-item{display:flex;align-items:flex-start;gap:6px;color:#333;font-size:12px;line-height:1.35;min-width:0;white-space:normal;word-break:break-all;cursor:pointer;}' +
+            '.shtx-filter-item input{accent-color:#e74c3c;flex:0 0 auto;margin-top:2px;}' +
+            '.shtx-filter-name{display:block;min-width:0;user-select:none;}' +
             '.shtx-autoload-simple{padding:6px 0;border-bottom:1px solid #eee;}' +
             '.shtx-autoload-simple a{color:#e74c3c;text-decoration:none;word-break:break-all;}';
         document.head.appendChild(s);
@@ -932,7 +935,9 @@
     }
     function setPreviewVisibility(visible) {
         STATE.previewVisible = !!visible;
+        $all('.shtx-preview-row, .shtx-preview-block').forEach(function(el) { el.style.display = visible ? '' : 'none'; });
         $all('.shtx-preview-container').forEach(function(el) { el.style.display = visible ? '' : 'none'; });
+        if (visible && isSearchResultPage()) applySearchFilter();
     }
     function fetchImages(tid) {
         var cached = getCachedPreviewImages(tid);
@@ -957,6 +962,7 @@
         return urls.slice(0, CONFIG.MAX_IMAGES);
     }
     function renderPreview(thread, imageUrls) {
+        if (isSearchResultPage() && !isThreadAllowedForPreview(thread)) return;
         var anchor = getPreviewMountNode(thread.link); if (!anchor || getPreviewContainerForAnchor(anchor, thread.tid)) return;
         var container = document.createElement('div'); container.className = 'shtx-preview-container';
         container.setAttribute('data-tid', thread.tid);
@@ -977,12 +983,20 @@
         if (!isPreviewToolPage() || STATE.previewRunning) return Promise.resolve();
         if (!STATE.previewVisible) return Promise.resolve();
         STATE.previewRunning = true; refreshThreads();
-        var pending = STATE.threads.filter(function(t) { var a = getPreviewMountNode(t.link); return a && !getPreviewContainerForAnchor(a, t.tid); });
+        var pending = STATE.threads.filter(function(t) {
+            if (isSearchResultPage() && !isThreadAllowedForPreview(t)) return false;
+            var a = getPreviewMountNode(t.link);
+            return a && !getPreviewContainerForAnchor(a, t.tid);
+        });
         if (pending.length === 0) { STATE.previewRunning = false; return Promise.resolve(); }
         function batch(i) {
             if (i >= pending.length) { STATE.previewRunning = false; dedupePreviewContainers(); return Promise.resolve(); }
             setStatusLine('preview', '加载 ' + Math.min(i + CONFIG.PREVIEW_CONCURRENCY, pending.length) + '/' + pending.length);
-            return Promise.all(pending.slice(i, i + CONFIG.PREVIEW_CONCURRENCY).map(function(t) { return fetchImages(t.tid).then(function(urls) { renderPreview(t, urls); }); })).then(function() { return batch(i + CONFIG.PREVIEW_CONCURRENCY); });
+            return Promise.all(pending.slice(i, i + CONFIG.PREVIEW_CONCURRENCY).map(function(t) {
+                return fetchImages(t.tid).then(function(urls) {
+                    if (!isSearchResultPage() || isThreadAllowedForPreview(t)) renderPreview(t, urls);
+                });
+            })).then(function() { return batch(i + CONFIG.PREVIEW_CONCURRENCY); });
         }
         return batch(0);
     }
@@ -1042,75 +1056,84 @@
             if (isInsideToolUi(a)) return; var tid = getTidFromHref(a.getAttribute('href') || a.href); if (!tid) return;
             var node = getThreadItemNode(a) || a.closest('tbody, tr, li, dl, .bbda, .pbw'); if (!node || isDocumentShellNode(node)) return;
             for (var i = 0; i < pairs.length; i++) { if (pairs[i].node === node || pairs[i].tid === tid) return; }
-            pairs.push({ tid: tid, node: node, fid: getSearchItemFid(node), visible: true });
+            pairs.push({ tid: tid, link: a, node: node, fid: getSearchItemFid(node), visible: true });
         });
         return pairs;
     }
+    function getSearchFilterContext() {
+        return {
+            visibleFids: getVisibleSearchFids(),
+            showUnknown: getBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true),
+            keywords: getSearchExcludeKeywords()
+        };
+    }
+    function isSearchItemAllowed(item, ctx) {
+        if (!item || !item.node) return false;
+        ctx = ctx || getSearchFilterContext();
+        var show = item.fid ? ctx.visibleFids.indexOf(String(item.fid)) !== -1 : ctx.showUnknown;
+        if (show && ctx.keywords.length) {
+            var text = textOf(item.node).toLowerCase();
+            show = !ctx.keywords.some(function(word) { return text.indexOf(word.toLowerCase()) !== -1; });
+        }
+        return show;
+    }
+    function getSearchItemFromThread(thread) {
+        if (!thread || !thread.link) return null;
+        var tid = thread.tid || getTidFromHref(thread.link.getAttribute('href') || thread.link.href);
+        var node = getThreadItemNode(thread.link) || thread.link.closest('tbody, tr, li, dl, .bbda, .pbw');
+        if (!tid || !node || isDocumentShellNode(node)) return null;
+        return { tid: tid, link: thread.link, node: node, fid: getSearchItemFid(node), visible: true };
+    }
+    function isThreadAllowedForPreview(thread, ctx) {
+        if (!isSearchResultPage()) return true;
+        return isSearchItemAllowed(getSearchItemFromThread(thread), ctx);
+    }
+    function setSearchItemVisible(item, visible) {
+        item.visible = visible;
+        if (item.node) item.node.style.display = visible ? '' : 'none';
+        var mount = item.link ? getPreviewMountNode(item.link) : item.node;
+        var preview = getPreviewWrapperForAnchor(mount, item.tid) || getPreviewWrapperForAnchor(item.node, item.tid);
+        if (preview) preview.style.display = visible && STATE.previewVisible ? '' : 'none';
+        var container = getPreviewContainerForAnchor(mount, item.tid) || getPreviewContainerForAnchor(item.node, item.tid);
+        if (container) container.style.display = visible && STATE.previewVisible ? '' : 'none';
+    }
     function applySearchFilter() {
         if (!isSearchResultPage()) return;
-        var vf = getVisibleSearchFids(), su = getBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true), kw = getSearchExcludeKeywords();
+        var ctx = getSearchFilterContext();
         getSearchResultItems().forEach(function(item) {
-            var v = item.fid ? vf.indexOf(String(item.fid)) !== -1 : su;
-            if (v && kw.length) {
-                var text = textOf(item.node).toLowerCase();
-                v = !kw.some(function(word) { return text.indexOf(word.toLowerCase()) !== -1; });
-            }
-            item.visible = v; if (item.node) item.node.style.display = v ? '' : 'none';
+            setSearchItemVisible(item, isSearchItemAllowed(item, ctx));
         });
     }
     function getSearchFilterStatusText() {
         if (!isSearchResultPage()) return '非搜索页';
-        var items = getSearchResultItems(), vf = getVisibleSearchFids(), su = getBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true), kw = getSearchExcludeKeywords();
-        var v = items.filter(function(it) {
-            var show = it.fid ? vf.indexOf(String(it.fid)) !== -1 : su;
-            if (show && kw.length) {
-                var text = textOf(it.node).toLowerCase();
-                show = !kw.some(function(word) { return text.indexOf(word.toLowerCase()) !== -1; });
-            }
-            return show;
-        }).length;
+        var items = getSearchResultItems(), ctx = getSearchFilterContext();
+        var v = items.filter(function(it) { return isSearchItemAllowed(it, ctx); }).length;
         return v + '/' + items.length + ' 显示';
     }
     function openSearchFilterDialog() {
         var dlg = createDialog('板块筛选', '780px');
         var vf = getVisibleSearchFids(), vm = {}; vf.forEach(function(f) { vm[String(f)] = true; });
-        var su = getBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true), items = siteItems(), words = getSearchExcludeKeywords();
-        var stats = {};
-        if (isSearchResultPage()) {
-            getSearchResultItems().forEach(function(it) { var fid = it.fid || 'unknown'; stats[fid] = (stats[fid] || 0) + 1; });
-        }
-        var statsHtml = '';
-        if (Object.keys(stats).length) {
-            var totalVisible = 0, totalHidden = 0;
-            items.forEach(function(it) { if (vm[it.fid]) totalVisible += (stats[it.fid] || 0); else totalHidden += (stats[it.fid] || 0); });
-            if (su) totalVisible += (stats['unknown'] || 0); else totalHidden += (stats['unknown'] || 0);
-            statsHtml = '<div class="shtx-settings-note" style="color:#27ae60;">当前结果：' + (totalVisible + totalHidden) + ' 条（显示 ' + totalVisible + ' / 隐藏 ' + totalHidden + '）</div>';
-        }
-        dlg.body.innerHTML = '<div class="shtx-settings-note">勾选要显示的板块，并可按关键词排除搜索结果；每行一个关键词。</div>' +
-            '<div class="shtx-row"><button class="shtx-btn shtx-blue" id="shtx-filter-all">全选</button>' +
+        var su = getBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true), items = siteItems();
+        dlg.body.innerHTML = '<div class="shtx-settings-note">勾选要显示的板块，板块名称不可编辑。</div>' +
+            '<div class="shtx-filter-actions"><button class="shtx-btn shtx-blue" id="shtx-filter-all">全选</button>' +
             '<button class="shtx-btn shtx-gray" id="shtx-filter-none">全不选</button>' +
             '<button class="shtx-btn shtx-green" id="shtx-filter-restore">一键恢复全部</button>' +
             '<label class="shtx-filter-item"><input id="shtx-filter-unknown" type="checkbox"' + (su ? ' checked' : '') + '>显示未识别板块</label></div>' +
-            statsHtml +
-            '<div class="shtx-filter-grid">' + items.map(function(it) {
-                var cnt = stats[it.fid] || 0;
-                return '<label class="shtx-filter-item"><input class="shtx-filter-fid" value="' + escapeHtml(it.fid) + '"' + (vm[it.fid] ? ' checked' : '') + '>' + escapeHtml(it.name) + (cnt ? ' <span style="color:#999;font-size:10px;">' + cnt + '</span>' : '') + '</label>';
-            }).join('') + '</div>' +
-            '<label class="shtx-settings-note" for="shtx-filter-keywords">排除关键字（命中统计见上方）</label><textarea id="shtx-filter-keywords" class="shtx-textarea" placeholder="每行一个关键词">' + escapeHtml(words.join('\n')) + '</textarea>';
+            '<div class="shtx-filter-list"><div class="shtx-filter-grid">' + items.map(function(it) {
+                return '<label class="shtx-filter-item"><input type="checkbox" class="shtx-filter-fid" data-fid="' + escapeHtml(it.fid) + '"' + (vm[it.fid] ? ' checked' : '') + '><span class="shtx-filter-name">' + escapeHtml(it.name) + '</span></label>';
+            }).join('') + '</div></div>';
         function apply() {
-            var sel = $all('.shtx-filter-fid:checked', dlg.body).map(function(inp) { return inp.value; });
+            var sel = $all('.shtx-filter-fid:checked', dlg.body).map(function(inp) { return inp.getAttribute('data-fid') || ''; }).filter(Boolean);
             saveVisibleSearchFids(sel); setBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, !!$('#shtx-filter-unknown', dlg.body).checked);
-            saveSearchExcludeKeywords(($('#shtx-filter-keywords', dlg.body).value || '').split(/\r?\n/));
             applySearchFilter(); createToolbar();
         }
         $all('.shtx-filter-fid', dlg.body).forEach(function(inp) { inp.addEventListener('change', apply); });
         $('#shtx-filter-unknown', dlg.body).addEventListener('change', apply);
-        $('#shtx-filter-keywords', dlg.body).addEventListener('input', apply);
         $('#shtx-filter-all', dlg.body).onclick = function() { $all('.shtx-filter-fid', dlg.body).forEach(function(inp) { inp.checked = true; }); apply(); };
         $('#shtx-filter-none', dlg.body).onclick = function() { $all('.shtx-filter-fid', dlg.body).forEach(function(inp) { inp.checked = false; }); apply(); };
         $('#shtx-filter-restore', dlg.body).onclick = function() {
             saveVisibleSearchFids(getAllSearchFids()); setBool(CONFIG.SEARCH_FILTER_SHOW_UNKNOWN_KEY, true);
-            saveSearchExcludeKeywords([]); dlg.close(); openSearchFilterDialog();
+            dlg.close(); openSearchFilterDialog();
             applySearchFilter(); createToolbar(); toast('已恢复全部');
         };
     }
