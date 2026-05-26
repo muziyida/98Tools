@@ -65,6 +65,8 @@
         TOOLBAR_POSITION_KEY: 'sht_toolbar_position',
         TASK_LOG_KEY: 'sht_task_log',
         TASK_LOG_MAX: 50,
+        NEXT_RETRY_MAX: 3,
+        NEXT_RETRY_BASE_MS: 1000,
     };
 
     var REPLY_POOL = [
@@ -112,6 +114,8 @@
         threadActionRunning: false,
         threadActionMessage: '',
         threadEnhanceTimer: null,
+        nextRetryCount: 0,
+        scrollRafPending: false,
     };
 
     // ============ UTILS ============
@@ -776,6 +780,7 @@
             updatePaginationFromDoc(doc);
             STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, pageNo);
 
+            STATE.nextRetryCount = 0;
             STATE.nextPagesLoading = false;
             if (!getNextPageUrl(document)) STATE.autoScrollEnd = true;
             setStatusLine('scroll', getPaginationStatusText());
@@ -784,9 +789,19 @@
             if (!fromAuto) toast('新增 ' + added + ' 个主题');
             checkAndLoadIfContentNotEnough();
         }).catch(function() {
+            STATE.nextRetryCount = (STATE.nextRetryCount || 0) + 1;
             STATE.nextPagesLoading = false;
-            setStatusLine('next-message', '加载失败');
-            toast('加载失败', 'error');
+            if (STATE.nextRetryCount <= CONFIG.NEXT_RETRY_MAX) {
+                var delay = CONFIG.NEXT_RETRY_BASE_MS * Math.pow(2, STATE.nextRetryCount - 1);
+                setStatusLine('next-message', '加载失败，' + (delay / 1000) + 's 后重试 (' + STATE.nextRetryCount + '/' + CONFIG.NEXT_RETRY_MAX + ')');
+                setTimeout(function() { loadNextPage(fromAuto); }, delay);
+            } else {
+                STATE.nextRetryCount = 0;
+                STATE.autoScrollEnd = false;
+                setStatusLine('scroll', getPaginationStatusText());
+                setStatusLine('next-message', '加载失败，点击重试');
+                if (!fromAuto) toast('加载失败', 'error');
+            }
         });
     }
     function getCurrentPageNumber() {
@@ -806,6 +821,7 @@
         return a ? normalizeUrl(a.getAttribute('href') || a.href) : '';
     }
     function buildNextPageUrl(page) {
+        if (isSearchResultPage()) { var url = new URL(location.href); url.searchParams.set('page', page); return url.href; }
         if (isFavoritePage()) return ORIGIN + '/home.php?mod=space&uid=' + encodeURIComponent(getUid()) + '&do=favorite&view=me&page=' + page;
         if (isUserThreadPage()) { var url = new URL(location.href); url.searchParams.set('page', page); return url.href; }
         if (isForumDisplayPage()) {
@@ -827,6 +843,15 @@
         });
         return max || 1;
     }
+    function getExistingTids() {
+        var tids = {};
+        $all('a[href*="viewthread"][href*="tid="], a[href*="thread-"]').forEach(function(a) {
+            if (isInsideToolUi(a)) return;
+            var tid = getTidFromHref(a.getAttribute('href') || a.href);
+            if (tid) tids[tid] = true;
+        });
+        return tids;
+    }
     function appendNewContent(doc, page) {
         var selector = getContentSelector();
         var target = document.querySelector(selector);
@@ -838,22 +863,38 @@
         sep.style.cssText = 'clear:both;text-align:center;margin:8px 0;padding:4px 0;border-top:1px dashed #ddd;color:#999;font-size:11px;';
         sep.textContent = '—— 第 ' + page + ' 页 ——';
         target.appendChild(sep);
+        var existing = getExistingTids();
         var added = 0;
         each(source.childNodes, function(child) {
             var clone = child.cloneNode(true);
             if (clone.nodeType === 1 && clone.setAttribute) clone.setAttribute('data-shtx-autoload-page', String(page));
-            target.appendChild(clone); added++;
+            if (clone.nodeType === 1 && clone.querySelectorAll) {
+                var links = clone.querySelectorAll('a[href*="viewthread"][href*="tid="], a[href*="thread-"]');
+                var isDupe = false;
+                for (var i = 0; i < links.length; i++) {
+                    var tid = getTidFromHref(links[i].getAttribute('href') || links[i].href);
+                    if (tid && existing[tid]) { isDupe = true; break; }
+                }
+                if (isDupe) return;
+                for (var i = 0; i < links.length; i++) {
+                    var tid = getTidFromHref(links[i].getAttribute('href') || links[i].href);
+                    if (tid) existing[tid] = true;
+                }
+            }
+            target.appendChild(clone);
+            added++;
         });
         return added;
     }
     function processPageContent(pageName) {
         if (pageName === 'isSearchPage') { applySearchFilter(); refreshThreads(); if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews(); }
-        else if (pageName === 'isForumDisplayPage') { refreshThreads(); if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews(); }
+        else if (pageName === 'isForumDisplayPage' || pageName === 'isSpacePage' || pageName === 'isMySpacePage' || pageName === 'isMyfavoritePage') { refreshThreads(); if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews(); }
         else if (pageName === 'isPostPage') initThreadEnhancements();
     }
     function updatePaginationFromDoc(doc) {
         var newer = $all('.pg', doc); if (!newer.length) return;
-        $all('.pg').forEach(function(pg, i) { pg.innerHTML = (newer[i] || newer[0]).innerHTML; });
+        var html = newer[newer.length - 1].innerHTML;
+        $all('.pg').forEach(function(pg) { pg.innerHTML = html; });
     }
     function isNearPageBottom() {
         var doc = document.documentElement;
@@ -863,7 +904,10 @@
     }
     function checkAndLoadIfContentNotEnough() {
         if (STATE.nextPagesLoading || STATE.autoScrollEnd) return;
-        if (document.body.offsetHeight <= window.innerHeight) loadNextPage(true);
+        var sel = getContentSelector();
+        var contentEl = sel ? document.querySelector(sel) : null;
+        var contentHeight = contentEl ? contentEl.offsetHeight : document.body.offsetHeight;
+        if (contentHeight <= window.innerHeight || isNearPageBottom()) loadNextPage(true);
     }
     function initAutoPagination() {
         if (!isNextPageLoadPage()) return;
@@ -871,12 +915,17 @@
         if (STATE.nextScrollBound) return;
         STATE.nextScrollBound = true;
         STATE.nextPagesAutoStarted = true;
-        var onScroll = function() {
-            if (STATE.nextPagesLoading || STATE.autoScrollEnd) return;
-            if (isNearPageBottom()) loadNextPage(true);
-        };
-        window.addEventListener('scroll', onScroll, { passive: true });
-        onScroll();
+        window.addEventListener('scroll', function() {
+            if (STATE.scrollRafPending || STATE.nextPagesLoading || STATE.autoScrollEnd) return;
+            STATE.scrollRafPending = true;
+            requestAnimationFrame(function() {
+                STATE.scrollRafPending = false;
+                if (!STATE.nextPagesLoading && !STATE.autoScrollEnd && isNearPageBottom()) {
+                    loadNextPage(true);
+                }
+            });
+        }, { passive: true });
+        if (isNearPageBottom()) loadNextPage(true);
     }
 
     // ============ IMAGE PREVIEW ============
