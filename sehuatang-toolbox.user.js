@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.0.2
+// @version      1.0.4
 // @description  自动签到、无缝翻页、图片预览、板块筛选、帖子操作、自动回复、批量收藏、资源导出
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -268,7 +268,7 @@
         if (isThreadPage()) return '#postlist';
         if (isSearchResultPage() || isForumDisplayPage()) return '#threadlist';
         if (isMyfavoritePage() || isFavoritePage()) return '#favorite_ul';
-        if (isUserThreadPage()) return '#threadlist';
+        if (isUserThreadPage()) return '#threadlist, #delform';
         if (isSpacePage()) return '#delform';
         if (isMySpacePage()) return '#threadlist';
         return '#threadlist';
@@ -276,6 +276,7 @@
     function getPageNameForScroll() {
         if (isSearchResultPage()) return 'isSearchPage';
         if (isForumDisplayPage()) return 'isForumDisplayPage';
+        if (isUserThreadPage()) return 'isUserThreadPage';
         if (isThreadPage()) return 'isPostPage';
         if (isSpacePage()) return 'isSpacePage';
         if (isMySpacePage()) return 'isMySpacePage';
@@ -753,7 +754,7 @@
         var nextUrl = getNextPageUrl(document);
         if (!nextUrl) {
             var detectedMax = Math.max(detectMaxPage(document) || 1, STATE.listMaxPage || 1);
-            if (basePage >= detectedMax) {
+            if (!isUserThreadPage() && basePage >= detectedMax) {
                 STATE.autoScrollEnd = true;
                 setStatusLine('scroll', getPaginationStatusText());
                 setStatusLine('next-message', '没有更多页面'); if (!fromAuto) toast('没有更多页面'); return;
@@ -776,7 +777,7 @@
 
         fetch(nextUrl, { credentials: 'include' }).then(function(r) { return r.text(); }).then(function(html) {
             var doc = new DOMParser().parseFromString(html, 'text/html');
-            var added = appendNewContent(doc, pageNo);
+            var added = isUserThreadPage() ? appendUserThreadRows(doc, pageNo) : appendNewContent(doc, pageNo);
             updatePaginationFromDoc(doc);
             STATE.loadedMaxPage = Math.max(STATE.loadedMaxPage || 1, pageNo);
 
@@ -886,8 +887,122 @@
         });
         return added;
     }
+    function nodeTag(node) { return node && node.tagName ? String(node.tagName).toUpperCase() : ''; }
+    function isTableSectionNode(node) { return /^(TBODY|THEAD|TFOOT)$/i.test(nodeTag(node)); }
+    function getTargetTable(target) {
+        if (!target) return null;
+        if (nodeTag(target) === 'TABLE') return target;
+        return target.querySelector ? target.querySelector('table') : null;
+    }
+    function ensureTargetTbody(target) {
+        var table = getTargetTable(target);
+        if (!table) return null;
+        var bodies = table.tBodies || [];
+        if (bodies.length) return bodies[bodies.length - 1];
+        var body = document.createElement('tbody');
+        table.appendChild(body);
+        return body;
+    }
+    function getUserThreadAppendTarget(target, rowNode) {
+        var tag = nodeTag(rowNode);
+        if (tag === 'TR') return ensureTargetTbody(target) || target;
+        if (tag === 'TBODY') return getTargetTable(target) || target;
+        return target;
+    }
+    function getTableColSpan(node) {
+        var row = nodeTag(node) === 'TR' ? node : (node && node.querySelector ? node.querySelector('tr') : null);
+        if (!row || !row.children) return 1;
+        var total = 0;
+        each(row.children, function(cell) {
+            if (/^(TD|TH)$/i.test(nodeTag(cell))) total += cell.colSpan || 1;
+        });
+        return Math.max(total, 1);
+    }
+    function createAutoloadSeparator(page, rowNode, insertTarget) {
+        var text = '—— 第 ' + page + ' 页 ——';
+        var rowTag = nodeTag(rowNode), targetTag = nodeTag(insertTarget);
+        var useTableRow = rowTag === 'TR' && /^(TBODY|THEAD|TFOOT)$/.test(targetTag);
+        var useTableBody = rowTag === 'TBODY' && targetTag === 'TABLE';
+        if (useTableRow || useTableBody) {
+            var tr = document.createElement('tr');
+            var td = document.createElement('td');
+            td.colSpan = getTableColSpan(rowNode);
+            td.style.cssText = 'text-align:center;padding:4px 0;border-top:1px dashed #ddd;color:#999;font-size:11px;';
+            td.textContent = text;
+            tr.appendChild(td);
+            if (useTableBody) {
+                var tbody = document.createElement('tbody');
+                tbody.className = 'shtx-autoload-sep';
+                tbody.setAttribute('data-page', String(page));
+                tbody.appendChild(tr);
+                return tbody;
+            }
+            tr.className = 'shtx-autoload-sep';
+            tr.setAttribute('data-page', String(page));
+            return tr;
+        }
+        var sep = document.createElement('div');
+        sep.className = 'shtx-autoload-sep';
+        sep.setAttribute('data-page', String(page));
+        sep.style.cssText = 'clear:both;text-align:center;margin:8px 0;padding:4px 0;border-top:1px dashed #ddd;color:#999;font-size:11px;';
+        sep.textContent = text;
+        return sep;
+    }
+    function getUserThreadRows(root) {
+        root = root || document;
+        var rows = [], seenTids = {};
+        $all('a[href*="viewthread"][href*="tid="], a[href*="thread-"]', root).forEach(function(a) {
+            if (isInsideToolUi(a)) return;
+            var tid = getTidFromHref(a.getAttribute('href') || a.href);
+            if (!tid || seenTids[tid]) return;
+            var node = getThreadItemNode(a);
+            if (!node || isDocumentShellNode(node) || isInlineNode(node)) return;
+            if (node.closest('.pg, .pgs, #toptb, .bm_hm, .th')) return;
+            if (node.tagName && /^(FORM|TABLE|TD|TH)$/i.test(node.tagName)) return;
+            if (node.classList && (node.classList.contains('shtx-toolbar') || node.classList.contains('shtx-preview-row') || node.classList.contains('shtx-preview-container') || node.classList.contains('shtx-autoload-sep'))) return;
+            seenTids[tid] = true;
+            rows.push({ tid: tid, node: node, link: a });
+        });
+        return rows;
+    }
+    function getUserThreadContentRoot(root, rows) {
+        root = root || document;
+        var el = root.querySelector ? root.querySelector(getContentSelector()) : null;
+        if (el) return el;
+        rows = rows || getUserThreadRows(root);
+        return rows.length && rows[0].node ? rows[0].node.parentNode : null;
+    }
+    function appendUserThreadRows(doc, page) {
+        var existingTids = {};
+        var currentRows = getUserThreadRows(document);
+        currentRows.forEach(function(r) { existingTids[r.tid] = true; });
+        var remoteRows = getUserThreadRows(doc);
+        var newRows = remoteRows.filter(function(r) { return !existingTids[r.tid]; });
+        var target = getUserThreadContentRoot(document, currentRows);
+        if (!target) return 0;
+        if (!newRows.length) return 0;
+        var firstTarget = getUserThreadAppendTarget(target, newRows[0].node);
+        firstTarget.appendChild(createAutoloadSeparator(page, newRows[0].node, firstTarget));
+        var added = 0;
+        newRows.forEach(function(r) {
+            var insertTarget = getUserThreadAppendTarget(target, r.node);
+            var clone = r.node.cloneNode(true);
+            clone.setAttribute('data-shtx-autoload-page', String(page));
+            insertTarget.appendChild(clone);
+            added++;
+        });
+        return added;
+    }
+    function afterUserThreadAppend() {
+        dedupeThreadItems();
+        dedupePreviewContainers();
+        refreshThreads();
+        setStatusLine('list-count', getThreadCountText());
+        if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews();
+    }
     function processPageContent(pageName) {
         if (pageName === 'isSearchPage') { applySearchFilter(); refreshThreads(); if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews(); }
+        else if (pageName === 'isUserThreadPage') { afterUserThreadAppend(); }
         else if (pageName === 'isForumDisplayPage' || pageName === 'isSpacePage' || pageName === 'isMySpacePage' || pageName === 'isMyfavoritePage') { refreshThreads(); if (getBool(CONFIG.AUTO_PREVIEW_KEY, true) && STATE.previewVisible) loadAllPreviews(); }
         else if (pageName === 'isPostPage') initThreadEnhancements();
     }
@@ -1055,11 +1170,55 @@
     function getUniqueTidsInNode(node) { var t = {}; if (!node || !node.querySelectorAll) return t; $all('a[href*="viewthread"][href*="tid="], a[href*="thread-"]', node).forEach(function(a) { if (isInsideToolUi(a)) return; var tid = getTidFromHref(a.getAttribute('href') || a.href); if (tid) t[tid] = true; }); return t; }
     function isSingleThreadItemNode(node, tid) { if (!node || isDocumentShellNode(node) || isInlineNode(node) || isBlockedPreviewArea(node)) return false; if (node.classList && node.classList.contains('shtx-preview-container')) return false; var tids = getUniqueTidsInNode(node); return !!tids[tid] && Object.keys(tids).length === 1; }
     function getThreadItemNode(link) { if (!link || !link.closest) return link ? link.parentElement : null; var tid = getTidFromHref(link.getAttribute('href') || link.href); var c = link.closest('tbody[id*="thread_"], tr, li, dl, .bbda'); if (isSingleThreadItemNode(c, tid)) return c; var n = link.parentElement; while (n && !isDocumentShellNode(n)) { if (isSingleThreadItemNode(n, tid)) return n; n = n.parentElement; } return null; }
-    function getPreviewMountNode(link) { if (!link || isBlockedPreviewArea(link)) return null; var n = getThreadItemNode(link); return n && !isInlineNode(n) ? n : null; }
+    function getUserThreadPreviewMountNode(link) {
+        if (!link || isBlockedPreviewArea(link)) return null;
+        var tid = getTidFromHref(link.getAttribute('href') || link.href);
+        var n = link.parentElement;
+        while (n && !isDocumentShellNode(n)) {
+            if (isInlineNode(n) || (n.tagName && /^(TD|TH)$/i.test(n.tagName))) { n = n.parentElement; continue; }
+            if (n.tagName && /^(FORM|TABLE)$/i.test(n.tagName)) return null;
+            if (isBlockedPreviewArea(n)) return null;
+            if (isSingleThreadItemNode(n, tid)) return n;
+            n = n.parentElement;
+        }
+        return null;
+    }
+    function getPreviewMountNode(link) {
+        if (!link || isBlockedPreviewArea(link)) return null;
+        if (isUserThreadPage()) {
+            var umn = getUserThreadPreviewMountNode(link);
+            if (umn) return umn;
+            var fallback = getThreadItemNode(link);
+            return fallback && !isInlineNode(fallback) && !/^(TD|TH|FORM|TABLE)$/i.test(nodeTag(fallback)) ? fallback : null;
+        }
+        var n = getThreadItemNode(link);
+        return n && !isInlineNode(n) ? n : null;
+    }
     function insertAfter(ref, node) { if (ref && ref.parentNode) ref.parentNode.insertBefore(node, ref.nextSibling); }
     function getPreviewWrapperForAnchor(anchor, tid) { if (!anchor || !anchor.nextElementSibling) return null; var n = anchor.nextElementSibling; while (n) { if (!n.classList || !(n.classList.contains('shtx-preview-row') || n.classList.contains('shtx-preview-block'))) break; if (!tid || n.getAttribute('data-tid') === tid || (n.querySelector && n.querySelector('.shtx-preview-container[data-tid="' + tid + '"]'))) return n; n = n.nextElementSibling; } return null; }
     function getPreviewContainerForAnchor(anchor, tid) { var w = getPreviewWrapperForAnchor(anchor, tid); if (w && w.querySelector) return w.querySelector('.shtx-preview-container[data-tid="' + tid + '"]'); return null; }
     function insertPreviewAfterAnchor(anchor, tid, container) {
+        var tag = nodeTag(anchor);
+        if (tag === 'TR' || isTableSectionNode(anchor)) {
+            var tr = document.createElement('tr');
+            var td = document.createElement('td');
+            td.colSpan = getTableColSpan(anchor);
+            td.style.cssText = 'padding:0;border:0;';
+            td.appendChild(container);
+            tr.appendChild(td);
+            if (isTableSectionNode(anchor)) {
+                var tbody = document.createElement('tbody');
+                tbody.className = 'shtx-preview-row';
+                tbody.setAttribute('data-tid', tid);
+                tbody.appendChild(tr);
+                insertAfter(anchor, tbody);
+            } else {
+                tr.className = 'shtx-preview-row';
+                tr.setAttribute('data-tid', tid);
+                insertAfter(anchor, tr);
+            }
+            return;
+        }
         var d = document.createElement('div');
         d.className = 'shtx-preview-row';
         d.setAttribute('data-tid', tid);
