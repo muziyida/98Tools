@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.0.4
+// @version      1.0.5
 // @description  自动签到、无缝翻页、图片预览、板块筛选、帖子操作、自动回复、批量收藏、资源导出
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -42,14 +42,14 @@
         OPEN_REGISTRY_KEY: 'sht_open_thread_tabs_v1',
         OPEN_TAB_ID_KEY: 'sht_open_thread_tab_id_v1',
         OPEN_HEARTBEAT_MS: 10000,
-        OPEN_STALE_MS: 45000,
+        OPEN_STALE_MS: 30 * 60 * 1000,
         FAVORITE_DELAY_MS: 600,
+        FAVORITE_CONCURRENCY: parseInt(localStorage.getItem('sht_favorite_concurrency') || '3', 10),
+        FAVORITE_WORKER_DELAY_MS: parseInt(localStorage.getItem('sht_favorite_worker_delay') || '300', 10),
 
         AUTO_REPLY_KEY: 'sht_auto_reply_enabled',
         AUTO_REPLY_STATE_KEY: 'sht_auto_reply',
         AUTO_REPLY_TARGET_FID: '155',
-        AUTO_REPLY_MAX_PER_SESSION: 5,
-        AUTO_REPLY_COOLDOWN: 60000,
 
         AUTO_PAGINATION_KEY: 'sht_auto_pagination',
         AUTO_SCROLL_THRESHOLD: 500,
@@ -114,6 +114,7 @@
         threadActionRunning: false,
         threadActionMessage: '',
         threadEnhanceTimer: null,
+        favoriteOpenedRunning: false,
         nextRetryCount: 0,
         scrollRafPending: false,
     };
@@ -421,7 +422,7 @@
     function createToolbar() {
         var old = $('#shtx-toolbar'); if (old) old.remove();
         var openCount = getOpenThreads().length;
-        var hasOpenTool = isThreadPage() || openCount > 0;
+        var hasOpenTool = true;
         var hasListTool = isListToolPage();
         var hasThreadTool = isThreadPage();
         var hasReplyTool = isThreadPage() && getFid() === CONFIG.AUTO_REPLY_TARGET_FID;
@@ -585,16 +586,16 @@
             setBool(CONFIG.AUTO_REPLY_KEY, v); createToolbar();
             if (v && isThreadPage() && getFid() === CONFIG.AUTO_REPLY_TARGET_FID) runAutoReply();
         });
-        var cooldownRow = document.createElement('div'); cooldownRow.className = 'shtx-switch-row';
-        cooldownRow.innerHTML = '<span class="shtx-switch-copy"><strong>回复冷却</strong><small>两次自动回复间隔秒数</small></span><select class="shtx-select" id="shtx-set-cooldown"><option value="30">30 秒</option><option value="60">60 秒</option><option value="120">120 秒</option></select>';
-        threadSec.appendChild(cooldownRow);
-        var cdSelect = $('#shtx-set-cooldown', dlg.root); cdSelect.value = String(CONFIG.AUTO_REPLY_COOLDOWN / 1000);
-        cdSelect.addEventListener('change', function() { CONFIG.AUTO_REPLY_COOLDOWN = parseInt(cdSelect.value, 10) * 1000; localStorage.setItem('sht_reply_cooldown', String(CONFIG.AUTO_REPLY_COOLDOWN)); });
-        var maxReplyRow = document.createElement('div'); maxReplyRow.className = 'shtx-switch-row';
-        maxReplyRow.innerHTML = '<span class="shtx-switch-copy"><strong>回复上限</strong><small>每会话最多自动回复次数</small></span><select class="shtx-select" id="shtx-set-maxreply"><option value="3">3 次</option><option value="5">5 次</option><option value="10">10 次</option></select>';
-        threadSec.appendChild(maxReplyRow);
-        var mrSelect = $('#shtx-set-maxreply', dlg.root); mrSelect.value = String(CONFIG.AUTO_REPLY_MAX_PER_SESSION);
-        mrSelect.addEventListener('change', function() { CONFIG.AUTO_REPLY_MAX_PER_SESSION = parseInt(mrSelect.value, 10); localStorage.setItem('sht_reply_max', String(CONFIG.AUTO_REPLY_MAX_PER_SESSION)); });
+
+        var batchSec = appendSettingsSection(dlg.body, '批量收藏');
+        var favConcurrencyRow = document.createElement('div'); favConcurrencyRow.className = 'shtx-switch-row';
+        favConcurrencyRow.innerHTML = '<span class="shtx-switch-copy"><strong>收藏打开帖子并发数</strong><small>同时收藏几个已打开帖子，1 等同串行</small></span><select class="shtx-select" id="shtx-set-favconcurrency"><option value="1">1 个</option><option value="2">2 个</option><option value="3">3 个</option><option value="5">5 个</option></select>';
+        batchSec.appendChild(favConcurrencyRow);
+        var favConcurrencySelect = $('#shtx-set-favconcurrency', dlg.root); favConcurrencySelect.value = String(getFavoriteConcurrency());
+        favConcurrencySelect.addEventListener('change', function() {
+            CONFIG.FAVORITE_CONCURRENCY = parseInt(favConcurrencySelect.value, 10);
+            localStorage.setItem('sht_favorite_concurrency', String(CONFIG.FAVORITE_CONCURRENCY));
+        });
 
         var toolbarSec = appendSettingsSection(dlg.body, '工具栏');
         var posRow = document.createElement('div'); posRow.className = 'shtx-switch-row';
@@ -1537,7 +1538,7 @@
     }
 
     // ============ AUTO REPLY ============
-    function loadAutoReplyState() { return readJson(CONFIG.AUTO_REPLY_STATE_KEY, { repliedTids: [], sessionCount: 0, lastReplyTime: 0 }); }
+    function loadAutoReplyState() { return readJson(CONFIG.AUTO_REPLY_STATE_KEY, { repliedTids: [] }); }
     function saveAutoReplyState(s) { writeJson(CONFIG.AUTO_REPLY_STATE_KEY, s); }
     function hasHiddenContent() { var t = document.body.textContent || ''; if (/回复可见|回复后可见|需要回复|回复才可以浏览|如果您要查看本帖隐藏内容请回复|以下内容需要回复才能|本帖隐藏的内容/.test(t)) return true; return !!$all('.locked, .alert_info, [id*="locked"]').some(function(el) { return /回复/.test(textOf(el)); }); }
     function getRandomReply() { var n = 1 + Math.floor(Math.random() * 2); return REPLY_POOL.slice().sort(function() { return Math.random() - 0.5; }).slice(0, n).join('，'); }
@@ -1555,9 +1556,7 @@
         if (!isThreadPage() || !getBool(CONFIG.AUTO_REPLY_KEY, true)) return;
         var tid = getTid(), fid = getFid(); if (fid !== CONFIG.AUTO_REPLY_TARGET_FID || !hasHiddenContent()) return;
         var s = loadAutoReplyState(); if (s.repliedTids.indexOf(tid) !== -1) return;
-        if ((s.sessionCount || 0) >= CONFIG.AUTO_REPLY_MAX_PER_SESSION) return;
-        if (Date.now() - (s.lastReplyTime || 0) < CONFIG.AUTO_REPLY_COOLDOWN) return;
-        getFormhash().then(function(fh) { if (!fh) return; var reply = getRandomReply(); return submitReply(reply, tid, fid, fh).then(function() { s.repliedTids.push(tid); if (s.repliedTids.length > 200) s.repliedTids = s.repliedTids.slice(-200); s.sessionCount = (s.sessionCount || 0) + 1; s.lastReplyTime = Date.now(); saveAutoReplyState(s); toast('已自动回复'); appendTaskLog('reply', '已自动回复', reply); setTimeout(function() { location.reload(); }, 2000); }); });
+        getFormhash().then(function(fh) { if (!fh) return; var reply = getRandomReply(); return submitReply(reply, tid, fid, fh).then(function() { s.repliedTids.push(tid); if (s.repliedTids.length > 200) s.repliedTids = s.repliedTids.slice(-200); saveAutoReplyState(s); toast('已自动回复'); appendTaskLog('reply', '已自动回复', reply); setTimeout(function() { location.reload(); }, 2000); }); });
     }
 
     // ============ OPEN TABS ============
@@ -1569,28 +1568,86 @@
     function registerCurrentThread() { if (!isThreadPage()) return; var reg = cleanOpenRegistry(readOpenRegistry()); reg[getOpenTabId()] = { tid: getTid(), title: getThreadTitle(), url: ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(getTid()), updatedAt: Date.now() }; writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); setStatusLine('open-count', getOpenThreads().length + ' 个'); }
     function unregisterCurrentThread() { if (!isThreadPage()) return; var reg = readOpenRegistry(); delete reg[getOpenTabId()]; writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); }
     function getOpenThreads() { var reg = cleanOpenRegistry(readOpenRegistry()); writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); var byTid = {}; Object.keys(reg).forEach(function(tabId) { var item = reg[tabId]; if (!item || !item.tid) return; if (!byTid[item.tid] || byTid[item.tid].updatedAt < item.updatedAt) byTid[item.tid] = item; }); return Object.keys(byTid).map(function(tid) { return byTid[tid]; }).sort(function(a, b) { return b.updatedAt - a.updatedAt; }); }
-    function initOpenRegistry() { writeJson(CONFIG.OPEN_REGISTRY_KEY, cleanOpenRegistry(readOpenRegistry())); if (isThreadPage()) { registerCurrentThread(); _timers.push(setInterval(registerCurrentThread, CONFIG.OPEN_HEARTBEAT_MS)); window.addEventListener('beforeunload', unregisterCurrentThread); window.addEventListener('pagehide', unregisterCurrentThread); window.addEventListener('unload', unregisterCurrentThread); } _timers.push(setInterval(function() { setStatusLine('open-count', getOpenThreads().length + ' 个'); }, CONFIG.OPEN_HEARTBEAT_MS)); }
+    function initOpenRegistry() { writeJson(CONFIG.OPEN_REGISTRY_KEY, cleanOpenRegistry(readOpenRegistry())); if (isThreadPage()) { registerCurrentThread(); _openRegistryTimers.push(setInterval(registerCurrentThread, CONFIG.OPEN_HEARTBEAT_MS)); window.addEventListener('beforeunload', unregisterCurrentThread); window.addEventListener('pagehide', unregisterCurrentThread); window.addEventListener('unload', unregisterCurrentThread); } _openRegistryTimers.push(setInterval(function() { setStatusLine('open-count', getOpenThreads().length + ' 个'); }, CONFIG.OPEN_HEARTBEAT_MS)); }
     function clearOpenThreadRecords() { writeJson(CONFIG.OPEN_REGISTRY_KEY, {}); setStatusLine('open-count', '0 个'); toast('已清理'); createToolbar(); }
     function removeOpenTid(tid) { var reg = readOpenRegistry(); Object.keys(reg).forEach(function(tabId) { if (reg[tabId] && reg[tabId].tid === tid) delete reg[tabId]; }); writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); }
+    function getFavoriteConcurrency() {
+        var n = parseInt(CONFIG.FAVORITE_CONCURRENCY, 10);
+        if (isNaN(n)) n = 3;
+        return Math.max(1, Math.min(5, n));
+    }
+    function getFavoriteWorkerDelay() {
+        var n = parseInt(CONFIG.FAVORITE_WORKER_DELAY_MS, 10);
+        if (isNaN(n)) n = 300;
+        return Math.max(0, Math.min(2000, n));
+    }
+    function getFavoriteDialogThreads(root, threads) {
+        var visible = {};
+        $all('.shtx-result-row[data-tid]', root).forEach(function(row) { visible[row.getAttribute('data-tid')] = true; });
+        return (threads || []).filter(function(item) { return item && visible[item.tid]; });
+    }
+    function updateFavoriteBatchProgress(progress, stats) {
+        if (!progress || !stats) return;
+        var pending = Math.max(stats.total - stats.done - stats.running, 0);
+        progress.textContent = '进度 ' + stats.done + '/' + stats.total + '，运行中 ' + stats.running + '，待处理 ' + pending + '，成功 ' + stats.success + '，已收藏 ' + stats.exists + '，失败 ' + stats.failed;
+    }
     function openFavoriteDialog() {
         var threads = getOpenThreads(); if (threads.length === 0) { toast('未检测到打开的帖子'); return; }
         var dlg = createDialog('收藏打开帖子', '680px');
         dlg.body.innerHTML = threads.map(function(item) { return '<div class="shtx-result-row" data-tid="' + escapeHtml(item.tid) + '"><a href="' + escapeHtml(item.url) + '" target="_blank">' + escapeHtml(item.title) + '</a><span class="shtx-status">待收藏</span><button class="shtx-btn shtx-gray" data-tid="' + escapeHtml(item.tid) + '" style="padding:3px 8px;">移除</button></div>'; }).join('');
         $all('.shtx-btn.shtx-gray', dlg.body).forEach(function(btn) { btn.onclick = function() { removeOpenTid(this.getAttribute('data-tid')); var r = this.closest('.shtx-result-row'); if (r) r.remove(); }; });
         var progress = document.createElement('div'); progress.className = 'shtx-status'; dlg.foot.appendChild(progress);
-        var startBtn = makeBtn('开始收藏', 'red', function() { batchFavoriteOpened(threads, progress, dlg.root, startBtn); });
+        var startBtn = makeBtn('开始收藏', 'red', function() { batchFavoriteOpened(getFavoriteDialogThreads(dlg.root, threads), progress, dlg.root, startBtn); });
         dlg.foot.appendChild(startBtn);
         dlg.foot.appendChild(makeBtn('刷新列表', 'blue', function() { dlg.close(); openFavoriteDialog(); }));
     }
     function batchFavoriteOpened(threads, progress, root, btn) {
-        if (btn && btn.disabled) return;
+        if (STATE.favoriteOpenedRunning || (btn && btn.disabled)) { toast('批量收藏正在运行'); return; }
+        threads = threads || [];
+        if (!threads.length) { if (progress) progress.textContent = '没有待收藏帖子'; toast('没有待收藏帖子'); return; }
+        STATE.favoriteOpenedRunning = true;
         if (btn) { btn.disabled = true; btn.textContent = '收藏中...'; }
-        getFormhash().then(function(fh) { if (!fh) throw new Error('请确认已登录'); var s = 0, e = 0, f = 0;
-            function next(i) { if (i >= threads.length) { progress.textContent = '成功 ' + s + '，已收藏 ' + e + '，失败 ' + f; toast('批量收藏完成'); if (btn) { btn.disabled = false; btn.textContent = '开始收藏'; } return; }
-                var item = threads[i]; progress.textContent = (i + 1) + '/' + threads.length + '：' + item.title;
-                favoriteThread(item.tid, fh).then(function(r) { if (r.state === 'success') { s++; setFavoriteRow(root, item.tid, r.label, '#27ae60'); } else if (r.state === 'exists') { e++; setFavoriteRow(root, item.tid, r.label, '#999'); } else { f++; setFavoriteRow(root, item.tid, r.label, '#e74c3c'); } setTimeout(function() { next(i + 1); }, CONFIG.FAVORITE_DELAY_MS); }); }
-            next(0);
-        }).catch(function(e) { progress.textContent = e.message || '批量收藏失败'; toast(progress.textContent, 'error'); if (btn) { btn.disabled = false; btn.textContent = '重新开始'; } });
+        function resetButton(text) {
+            STATE.favoriteOpenedRunning = false;
+            if (btn) { btn.disabled = false; btn.textContent = text || '开始收藏'; }
+        }
+        function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+        getFormhash().then(function(fh) {
+            if (!fh) throw new Error('请确认已登录');
+            var stats = { total: threads.length, done: 0, running: 0, success: 0, exists: 0, failed: 0 };
+            var nextIndex = 0;
+            var concurrency = Math.min(getFavoriteConcurrency(), threads.length);
+            updateFavoriteBatchProgress(progress, stats);
+            function worker() {
+                var index = nextIndex++;
+                if (index >= threads.length) return Promise.resolve();
+                var item = threads[index];
+                stats.running++;
+                setFavoriteRow(root, item.tid, '收藏中...', '#3498db');
+                updateFavoriteBatchProgress(progress, stats);
+                return favoriteThread(item.tid, fh).catch(function() {
+                    return { state: 'error', label: '网络失败' };
+                }).then(function(r) {
+                    stats.running--;
+                    stats.done++;
+                    if (r.state === 'success') { stats.success++; setFavoriteRow(root, item.tid, r.label, '#27ae60'); }
+                    else if (r.state === 'exists') { stats.exists++; setFavoriteRow(root, item.tid, r.label, '#999'); }
+                    else { stats.failed++; setFavoriteRow(root, item.tid, r.label, '#e74c3c'); }
+                    updateFavoriteBatchProgress(progress, stats);
+                    return wait(getFavoriteWorkerDelay());
+                }).then(worker);
+            }
+            return Promise.all(Array.from({ length: concurrency }, worker)).then(function() {
+                updateFavoriteBatchProgress(progress, stats);
+                appendTaskLog('fav', '批量收藏完成', '成功 ' + stats.success + '，已收藏 ' + stats.exists + '，失败 ' + stats.failed);
+                toast('批量收藏完成');
+                resetButton('重新开始');
+            });
+        }).catch(function(e) {
+            if (progress) progress.textContent = e.message || '批量收藏失败';
+            toast(progress ? progress.textContent : '批量收藏失败', 'error');
+            resetButton('重新开始');
+        });
     }
     function setFavoriteRow(root, tid, text, color) { var el = root.querySelector('.shtx-result-row[data-tid="' + tid + '"] .shtx-status'); if (!el) return; el.textContent = text; el.style.color = color || '#777'; }
 
@@ -2023,6 +2080,7 @@
 
     // ============ INIT ============
     var _timers = [];
+    var _openRegistryTimers = [];
     var _observer = null;
     var _storageDebounce = 0;
 
@@ -2032,10 +2090,7 @@
         if (_observer) { _observer.disconnect(); _observer = null; }
     }
     function resumeAll() {
-        if (!isThreadPage()) return;
-        _timers.push(setInterval(registerCurrentThread, CONFIG.OPEN_HEARTBEAT_MS));
-        _timers.push(setInterval(function() { setStatusLine('open-count', getOpenThreads().length + ' 个'); }, CONFIG.OPEN_HEARTBEAT_MS));
-        startMutationObserver();
+        if (isThreadPage()) startMutationObserver();
     }
 
     function init() {
@@ -2072,11 +2127,9 @@
                 localStorage.setItem(pair[1], oldVal);
             }
         });
-        var persisted = { img: 'sht_preview_img_count', dist: 'sht_scroll_threshold', cd: 'sht_reply_cooldown', max: 'sht_reply_max' };
+        var persisted = { img: 'sht_preview_img_count', dist: 'sht_scroll_threshold' };
         var img = parseInt(localStorage.getItem(persisted.img), 10); if (img >= 3 && img <= 8) CONFIG.MAX_IMAGES = img;
         var dist = parseInt(localStorage.getItem(persisted.dist), 10); if (dist >= 100 && dist <= 2000) CONFIG.AUTO_SCROLL_THRESHOLD = dist;
-        var cd = parseInt(localStorage.getItem(persisted.cd), 10); if (cd >= 10000 && cd <= 300000) CONFIG.AUTO_REPLY_COOLDOWN = cd;
-        var max = parseInt(localStorage.getItem(persisted.max), 10); if (max >= 1 && max <= 50) CONFIG.AUTO_REPLY_MAX_PER_SESSION = max;
     }
 
     setTimeout(init, 500);
