@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         色花堂工具箱
 // @namespace    https://sehuatang.net/
-// @version      1.0.5
+// @version      1.0.15
 // @description  自动签到、无缝翻页、图片预览、板块筛选、帖子操作、自动回复、批量收藏、资源导出
 // @author       米波
 // @match        https://sehuatang.net/*
@@ -10,6 +10,13 @@
 // @match        https://www.sehuatang.org/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_getTab
+// @grant        GM_saveTab
+// @grant        GM_getTabs
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
 // @run-at       document-end
 // ==/UserScript==
@@ -25,6 +32,7 @@
         IMAGE_WIDTH: 240,
         MAX_IMAGES: 6,
         PREVIEW_CONCURRENCY: 6,
+        SEARCH_CONCURRENCY: 4,
         ALL_PAGES: 120,
         EXPORT_DELAY_MS: 200,
         EXPORT_CONCURRENCY: 3,
@@ -40,8 +48,12 @@
         RATE_REASON: '永久地址 WWW.98T.LA',
 
         OPEN_REGISTRY_KEY: 'sht_open_thread_tabs_v1',
+        OPEN_REFRESH_KEY: 'sht_open_thread_refresh_v1',
         OPEN_TAB_ID_KEY: 'sht_open_thread_tab_id_v1',
+        OPEN_TAB_RECORD_KEY: 'shtOpenThreadRecord',
         OPEN_HEARTBEAT_MS: 10000,
+        OPEN_REFRESH_WAIT_MS: 2500,
+        OPEN_REFRESH_POLL_MS: 150,
         OPEN_STALE_MS: 30 * 60 * 1000,
         FAVORITE_DELAY_MS: 600,
         FAVORITE_CONCURRENCY: parseInt(localStorage.getItem('sht_favorite_concurrency') || '3', 10),
@@ -128,6 +140,32 @@
     function setBool(k, v) { localStorage.setItem(k, v ? 'true' : 'false'); }
     function readJson(k, fb) { try { var r = localStorage.getItem(k); return r ? JSON.parse(r) : fb; } catch(e) { return fb; } }
     function writeJson(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e) {} }
+    function readStoredJson(k, fb) {
+        try {
+            if (typeof GM_getValue === 'function') {
+                var v = GM_getValue(k, fb);
+                return v == null ? fb : v;
+            }
+        } catch(e) {}
+        return readJson(k, fb);
+    }
+    function writeStoredJson(k, v) {
+        try {
+            if (typeof GM_setValue === 'function') { GM_setValue(k, v); return; }
+        } catch(e) {}
+        writeJson(k, v);
+    }
+    function addStoredValueListener(k, fn) {
+        try {
+            if (typeof GM_addValueChangeListener === 'function') {
+                GM_addValueChangeListener(k, function(name, oldValue, newValue, remote) {
+                    fn(newValue, oldValue, remote);
+                });
+                return true;
+            }
+        } catch(e) {}
+        return false;
+    }
     function escapeHtml(v) { var d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; }
     function escapeRegExp(v) { return String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
     function isInsideToolUi(el) { return !!(el && el.closest && el.closest('#shtx-toolbar, #shtx-dialog, #shtx-toast, .shtx-preview-container')); }
@@ -200,6 +238,41 @@
         a.href = url; a.download = filename; document.body.appendChild(a); a.click();
         document.body.removeChild(a); URL.revokeObjectURL(url); toast('文件已下载');
     }
+    function runLimitedQueue(items, options) {
+        items = items || [];
+        options = options || {};
+        var total = items.length;
+        var concurrency = Math.max(1, Math.min(parseInt(options.concurrency, 10) || 1, total || 1));
+        var nextIndex = 0, stopped = false;
+        function shouldStop() {
+            return stopped || (typeof options.shouldStop === 'function' && options.shouldStop());
+        }
+        function wait(ms) {
+            ms = parseInt(ms, 10);
+            return new Promise(function(resolve) { setTimeout(resolve, isNaN(ms) ? 0 : Math.max(0, ms)); });
+        }
+        function getDelay(item, index, result, elapsed) {
+            var delay = typeof options.delay === 'function' ? options.delay(item, index, result, elapsed) : options.delay;
+            delay = parseInt(delay, 10);
+            return isNaN(delay) ? 0 : Math.max(0, delay);
+        }
+        function runNext() {
+            if (shouldStop()) { stopped = true; return Promise.resolve(); }
+            var index = nextIndex++;
+            if (index >= total) return Promise.resolve();
+            var item = items[index];
+            var start = Date.now();
+            return Promise.resolve().then(function() {
+                return options.run(item, index);
+            }).then(function(result) {
+                return wait(getDelay(item, index, result, Date.now() - start)).then(function() { return result; });
+            }).then(runNext);
+        }
+        if (!total) return Promise.resolve({ stopped: false });
+        return Promise.all(Array.from({ length: concurrency }, runNext)).then(function() {
+            return { stopped: stopped };
+        });
+    }
 
     // ============ PAGE DETECTION ============
     function getParams() { return new URLSearchParams(location.search); }
@@ -264,6 +337,7 @@
     }
     function isListToolPage() { return isFavoritePage() || isUserThreadPage(); }
     function isNextPageLoadPage() { return isListToolPage() || isForumDisplayPage() || isSearchResultPage() || isThreadPage() || isSpacePage() || isMySpacePage() || isMyfavoritePage(); }
+    function isAutoPaginationPage() { return isNextPageLoadPage() && !isThreadPage(); }
 
     function getContentSelector() {
         if (isThreadPage()) return '#postlist';
@@ -290,62 +364,80 @@
         if ($('#shtx-style')) return;
         var s = document.createElement('style'); s.id = 'shtx-style';
         s.textContent =
-            '.shtx-toolbar{position:fixed;top:50%;z-index:99999;transform:translateY(-50%);display:flex;flex-direction:column;gap:6px;padding:12px 10px;background:#f8f9fa;border:1px solid #dee2e6;max-width:200px;font:12px/1.4 Arial,"Microsoft YaHei",sans-serif;color:#555;}' +
-            '.shtx-toolbar.shtx-left{left:0;border-left:0;border-radius:0 8px 8px 0;box-shadow:2px 2px 10px rgba(0,0,0,0.15);}' +
-            '.shtx-toolbar.shtx-right{right:0;border-right:0;border-radius:8px 0 0 8px;box-shadow:-2px 2px 10px rgba(0,0,0,0.15);}' +
-            '.shtx-folder-body{display:flex;flex-direction:column;gap:6px;}' +
-            '.shtx-toolbar.shtx-collapsed{padding:8px 6px;min-width:0;}' +
+            ':root{--shtx-accent:#d94b45;--shtx-accent-dark:#b43a35;--shtx-ink:#1f2933;--shtx-muted:#687385;--shtx-line:#cbd5e1;--shtx-panel:#f1f5f9;}' +
+            '.shtx-toolbar{position:fixed;top:50%;z-index:99999;transform:translateY(-50%);display:flex;flex-direction:column;gap:10px;width:224px;max-width:calc(100vw - 24px);padding:12px;background:rgba(248,250,252,.98);border:1px solid var(--shtx-line);border-radius:8px;font:12px/1.45 Arial,"Microsoft YaHei",sans-serif;color:var(--shtx-ink);box-sizing:border-box;box-shadow:0 16px 42px rgba(15,23,42,.24);backdrop-filter:blur(10px);}' +
+            '.shtx-toolbar.shtx-left{left:10px;}' +
+            '.shtx-toolbar.shtx-right{right:10px;}' +
+            '.shtx-toolbar-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-bottom:8px;border-bottom:1px solid var(--shtx-line);}' +
+            '.shtx-toolbar-body{display:flex;flex-direction:column;gap:10px;}' +
+            '.shtx-toolbar-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}' +
+            '.shtx-folder-body{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}' +
+            '.shtx-toolbar.shtx-collapsed{width:auto;padding:8px;min-width:0;}' +
             '.shtx-toolbar.shtx-collapsed .shtx-toolbar-body{display:none;}' +
-            '.shtx-title{font-weight:bold;font-size:13px;color:#e74c3c;white-space:nowrap;margin-bottom:2px;}' +
-            '.shtx-collapse-btn{width:42px;height:24px;padding:0;border:0;border-radius:4px;background:#e74c3c;color:#fff;cursor:pointer;font-size:12px;font-weight:bold;line-height:24px;}' +
-            '.shtx-section-title{font-size:12px;color:#666;border-top:1px solid #e4e7eb;padding-top:6px;margin-top:4px;white-space:nowrap;}' +
+            '.shtx-title{font-weight:700;font-size:13px;color:var(--shtx-ink);white-space:nowrap;letter-spacing:0;}' +
+            '.shtx-title:before{content:"";display:inline-block;width:6px;height:16px;margin-right:7px;border-radius:3px;background:var(--shtx-accent);vertical-align:-3px;}' +
+            '.shtx-collapse-btn{width:42px;height:26px;padding:0;border:1px solid rgba(217,75,69,.38);border-radius:6px;background:#ffeceb;color:var(--shtx-accent-dark);cursor:pointer;font-size:12px;font-weight:700;line-height:24px;}' +
+            '.shtx-collapse-btn:hover{background:#ffdeda;border-color:rgba(217,75,69,.55);}' +
+            '.shtx-section-title{font-size:12px;color:var(--shtx-muted);border-top:1px solid var(--shtx-line);padding-top:8px;margin-top:2px;white-space:nowrap;font-weight:700;}' +
             '.shtx-section-title:first-child{border-top:0;padding-top:0;margin-top:0;}' +
-            '.shtx-btn{padding:6px 12px;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap;font-weight:bold;}' +
+            '.shtx-btn{min-height:30px;padding:6px 9px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:#334155;cursor:pointer;font-size:12px;white-space:normal;font-weight:700;line-height:1.25;box-sizing:border-box;box-shadow:0 1px 0 rgba(24,34,49,.06);}' +
+            '.shtx-btn:hover{border-color:#94a3b8;background:#f8fafc;}' +
             '.shtx-btn:disabled{opacity:.65;cursor:not-allowed;}' +
-            '.shtx-red{background:#e74c3c}.shtx-blue{background:#3498db}.shtx-green{background:#27ae60}.shtx-gray{background:#95a5a6}.shtx-orange{background:#e67e22}' +
-            '.shtx-status{color:#666;font-size:12px;white-space:normal;line-height:1.45;}' +
-            '.shtx-status-line{display:flex;align-items:center;justify-content:space-between;gap:8px;color:#666;font-size:12px;line-height:1.45;}' +
-            '.shtx-status-label{color:#888;white-space:nowrap;}' +
-            '.shtx-status-value{color:#333;font-weight:bold;text-align:right;word-break:break-all;}' +
-            '.shtx-settings-section{border-top:1px solid #eee;padding-top:12px;margin-top:12px;}' +
+            '.shtx-red{background:var(--shtx-accent);border-color:var(--shtx-accent);color:#fff;box-shadow:0 6px 14px rgba(217,75,69,.2);}' +
+            '.shtx-red:hover{background:var(--shtx-accent-dark);border-color:var(--shtx-accent-dark);}' +
+            '.shtx-blue{background:#e5f1ff;border-color:#a9caef;color:#1d5f9f;}' +
+            '.shtx-green{background:#e3f4ed;border-color:#a9d7c3;color:#1f6b4d;}' +
+            '.shtx-gray{background:#f1f5f9;border-color:#cbd5e1;color:#526173;}' +
+            '.shtx-orange{background:#fff0db;border-color:#eac17d;color:#96612b;}' +
+            '.shtx-status{color:var(--shtx-muted);font-size:12px;white-space:normal;line-height:1.45;}' +
+            '.shtx-status-panel{display:grid;gap:6px;padding:8px;background:var(--shtx-panel);border:1px solid var(--shtx-line);border-radius:8px;}' +
+            '.shtx-status-panel .shtx-section-title{border-top:0;padding-top:0;margin:0 0 2px;color:#415066;}' +
+            '.shtx-status-line{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--shtx-muted);font-size:12px;line-height:1.4;padding:2px 0;}' +
+            '.shtx-status-label{color:#7b8797;white-space:nowrap;}' +
+            '.shtx-status-value{color:var(--shtx-ink);font-weight:700;text-align:right;word-break:break-all;}' +
+            '.shtx-settings-section{border-top:1px solid #d8e0ea;padding-top:12px;margin-top:12px;}' +
             '.shtx-settings-section:first-child{border-top:0;padding-top:0;margin-top:0;}' +
-            '.shtx-settings-title{font-weight:bold;color:#e74c3c;margin-bottom:8px;font-size:14px;}' +
-            '.shtx-settings-note{color:#888;font-size:12px;line-height:1.5;margin:4px 0 10px;}' +
-            '.shtx-switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid #f2f2f2;cursor:pointer;}' +
+            '.shtx-settings-title{font-weight:700;color:#1f2933;margin-bottom:8px;font-size:14px;}' +
+            '.shtx-settings-note{color:#7b8797;font-size:12px;line-height:1.5;margin:4px 0 10px;}' +
+            '.shtx-switch-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 0;border-bottom:1px solid #d8e0ea;cursor:pointer;}' +
             '.shtx-switch-copy{display:flex;flex-direction:column;gap:2px;min-width:0;}' +
-            '.shtx-switch-copy strong{font-size:13px;color:#333;font-weight:bold;}' +
-            '.shtx-switch-copy small{font-size:12px;color:#888;line-height:1.45;}' +
-            '.shtx-check{width:16px;height:16px;flex:0 0 auto;accent-color:#e74c3c;cursor:pointer;}' +
+            '.shtx-switch-copy strong{font-size:13px;color:#1f2933;font-weight:700;}' +
+            '.shtx-switch-copy small{font-size:12px;color:#7b8797;line-height:1.45;}' +
+            '.shtx-check{width:16px;height:16px;flex:0 0 auto;accent-color:var(--shtx-accent);cursor:pointer;}' +
             '.shtx-preview-container{display:grid;grid-template-columns:repeat(3,' + CONFIG.IMAGE_WIDTH + 'px);gap:4px;margin:6px 0 8px;width:100%;max-width:' + (CONFIG.IMAGE_WIDTH * 3 + 8) + 'px;box-sizing:border-box;}' +
             '.shtx-preview-container a{display:block;}' +
-            '.shtx-preview-container img{display:block;width:' + CONFIG.IMAGE_WIDTH + 'px!important;height:' + CONFIG.IMAGE_HEIGHT + 'px!important;object-fit:cover;border-radius:3px;border:1px solid #ddd;}' +
-            '.shtx-preview-empty{padding:8px;color:#aaa;font-size:11px;}' +
-            '.shtx-dialog{display:flex;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:80%;max-width:680px;max-height:80vh;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.3);z-index:999999;overflow:hidden;flex-direction:column;font:13px/1.45 Arial,"Microsoft YaHei",sans-serif;color:#333;}' +
-            '.shtx-dialog-head{padding:14px 16px;background:#f8f9fa;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center;gap:10px;}' +
-            '.shtx-dialog-body{flex:1;overflow:auto;padding:12px 16px;}' +
-            '.shtx-dialog-foot{padding:10px 16px;border-top:1px solid #eee;font-size:12px;color:#999;}' +
-            '.shtx-close{background:none;border:none;font-size:20px;cursor:pointer;color:#999;line-height:1;}' +
+            '.shtx-preview-container img{display:block;width:' + CONFIG.IMAGE_WIDTH + 'px!important;height:' + CONFIG.IMAGE_HEIGHT + 'px!important;object-fit:cover;border-radius:6px;border:1px solid #cbd5e1;}' +
+            '.shtx-preview-empty{padding:8px;color:#9aa5b5;font-size:11px;}' +
+            '.shtx-dialog{display:flex;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:min(86vw,680px);max-width:86vw;max-height:82vh;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 24px 70px rgba(15,23,42,.3);z-index:999999;overflow:hidden;flex-direction:column;font:13px/1.45 Arial,"Microsoft YaHei",sans-serif;color:#1f2933;}' +
+            '.shtx-dialog-head{padding:14px 16px;background:#f1f5f9;border-bottom:1px solid #cbd5e1;display:flex;justify-content:space-between;align-items:center;gap:10px;}' +
+            '.shtx-dialog-title{font-weight:700;font-size:14px;color:#1f2933;}' +
+            '.shtx-dialog-body{flex:1;overflow:auto;padding:14px 16px;background:#fff;}' +
+            '.shtx-dialog-foot{padding:12px 16px;border-top:1px solid #d8e0ea;font-size:12px;color:#7b8797;background:#f8fafc;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}' +
+            '.shtx-close{width:28px;height:28px;background:#fff;border:1px solid #cbd5e1;border-radius:6px;font-size:18px;cursor:pointer;color:#687385;line-height:24px;}' +
+            '.shtx-close:hover{background:#f8fafc;color:#1f2933;}' +
             '.shtx-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;}' +
-            '.shtx-input,.shtx-select{padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:13px;outline:none;}' +
-            '.shtx-textarea{width:100%;box-sizing:border-box;min-height:72px;padding:7px 10px;border:1px solid #ddd;border-radius:4px;font-size:13px;line-height:1.5;outline:none;resize:vertical;}' +
-            '.shtx-result-row{display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid #f0f0f0;font-size:13px;}' +
-            '.shtx-result-row a{color:#e74c3c;text-decoration:none;flex:1;word-break:break-all;line-height:1.4;}' +
-            '.shtx-code-copy{margin:4px 0 6px;padding:3px 8px;background:#3498db;color:#fff;border:0;border-radius:4px;cursor:pointer;font-size:12px;}' +
+            '.shtx-input,.shtx-select{padding:7px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;outline:none;background:#fff;color:#1f2933;}' +
+            '.shtx-input:focus,.shtx-select:focus,.shtx-textarea:focus{border-color:#92b7dd;box-shadow:0 0 0 3px rgba(66,133,244,.12);}' +
+            '.shtx-textarea{width:100%;box-sizing:border-box;min-height:72px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;line-height:1.5;outline:none;resize:vertical;}' +
+            '.shtx-result-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-bottom:1px solid #d8e0ea;font-size:13px;}' +
+            '.shtx-result-row a{color:#b43a35;text-decoration:none;flex:1;word-break:break-all;line-height:1.45;}' +
+            '.shtx-result-row a:hover{text-decoration:underline;}' +
+            '.shtx-code-copy{margin:4px 0 6px;padding:4px 9px;background:#eef6ff;color:#1d5f9f;border:1px solid #cfe3ff;border-radius:6px;cursor:pointer;font-size:12px;font-weight:700;}' +
             '.shtx-filter-actions{display:flex;align-items:center;gap:8px;margin:0 0 10px;flex-wrap:wrap;}' +
-            '.shtx-filter-list{max-height:52vh;overflow:auto;border:1px solid #eee;border-radius:6px;background:#fafafa;padding:8px;box-sizing:border-box;}' +
+            '.shtx-filter-list{max-height:52vh;overflow:auto;border:1px solid #cbd5e1;border-radius:8px;background:#f8fafc;padding:8px;box-sizing:border-box;}' +
             '.shtx-filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px 10px;margin:0;}' +
-            '.shtx-filter-item{display:flex;align-items:flex-start;gap:6px;color:#333;font-size:12px;line-height:1.35;min-width:0;white-space:normal;word-break:break-all;cursor:pointer;}' +
-            '.shtx-filter-item input{accent-color:#e74c3c;flex:0 0 auto;margin-top:2px;}' +
+            '.shtx-filter-item{display:flex;align-items:flex-start;gap:6px;color:#334155;font-size:12px;line-height:1.35;min-width:0;white-space:normal;word-break:break-all;cursor:pointer;}' +
+            '.shtx-filter-item input{accent-color:var(--shtx-accent);flex:0 0 auto;margin-top:2px;}' +
             '.shtx-filter-name{display:block;min-width:0;user-select:none;}' +
-            '.shtx-autoload-simple{padding:6px 0;border-bottom:1px solid #eee;}' +
-            '.shtx-autoload-simple a{color:#e74c3c;text-decoration:none;word-break:break-all;}';
+            '.shtx-autoload-simple{padding:6px 0;border-bottom:1px solid #d8e0ea;}' +
+            '.shtx-autoload-simple a{color:#b43a35;text-decoration:none;word-break:break-all;}';
         document.head.appendChild(s);
     }
 
     // ============ TOOLBAR ============
     function makeBtn(text, color, handler) {
         var b = document.createElement('button'); b.className = 'shtx-btn shtx-' + (color || 'gray');
-        b.textContent = text; b.addEventListener('click', handler); return b;
+        b.type = 'button'; b.textContent = text; b.addEventListener('click', handler); return b;
     }
     function appendSection(bar, title) {
         var el = document.createElement('div'); el.className = 'shtx-section-title';
@@ -355,7 +447,7 @@
         var old = $('#shtx-dialog'); if (old) old.remove();
         var dlg = document.createElement('div'); dlg.id = 'shtx-dialog'; dlg.className = 'shtx-dialog';
         if (width) dlg.style.width = width;
-        dlg.innerHTML = '<div class="shtx-dialog-head"><span style="font-weight:bold;font-size:14px;">' + escapeHtml(title) + '</span><button class="shtx-close">&times;</button></div><div class="shtx-dialog-body"></div><div class="shtx-dialog-foot"></div>';
+        dlg.innerHTML = '<div class="shtx-dialog-head"><span class="shtx-dialog-title">' + escapeHtml(title) + '</span><button class="shtx-close" type="button">&times;</button></div><div class="shtx-dialog-body"></div><div class="shtx-dialog-foot"></div>';
         var close = function() { dlg.remove(); };
         $('.shtx-close', dlg).onclick = close;
         document.body.appendChild(dlg);
@@ -421,7 +513,7 @@
 
     function createToolbar() {
         var old = $('#shtx-toolbar'); if (old) old.remove();
-        var openCount = getOpenThreads().length;
+        var openCount = OpenThreadRegistry.list().length;
         var hasOpenTool = true;
         var hasListTool = isListToolPage();
         var hasThreadTool = isThreadPage();
@@ -432,9 +524,10 @@
         var bar = document.createElement('div');
         bar.id = 'shtx-toolbar'; bar.className = 'shtx-toolbar shtx-' + getToolbarPosition() + (getBool(CONFIG.TOOLBAR_COLLAPSED_KEY, false) ? ' shtx-collapsed' : '');
 
-        var head = document.createElement('div'); head.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;';
+        var head = document.createElement('div'); head.className = 'shtx-toolbar-head';
         var title = document.createElement('div'); title.className = 'shtx-title'; title.textContent = '色花堂工具箱';
         var collapseBtn = document.createElement('button'); collapseBtn.className = 'shtx-collapse-btn';
+        collapseBtn.type = 'button';
         collapseBtn.textContent = getBool(CONFIG.TOOLBAR_COLLAPSED_KEY, false) ? '展开' : '收起';
         collapseBtn.addEventListener('click', function() {
             var c = !getBool(CONFIG.TOOLBAR_COLLAPSED_KEY, false);
@@ -443,10 +536,12 @@
             collapseBtn.textContent = c ? '展开' : '收起';
         });
         head.appendChild(title); head.appendChild(collapseBtn); bar.appendChild(head);
-        bar.appendChild(makeBtn('设置', 'red', openSettingsDialog));
-        bar.appendChild(makeBtn('记录', 'gray', openTaskLogDialog));
 
         var body = document.createElement('div'); body.className = 'shtx-toolbar-body';
+        var actions = document.createElement('div'); actions.className = 'shtx-toolbar-actions';
+        actions.appendChild(makeBtn('设置', 'red', openSettingsDialog));
+        actions.appendChild(makeBtn('记录', 'gray', openTaskLogDialog));
+        body.appendChild(actions);
 
         if (hasPreviewTool || isSearchResultPage() || hasNextTool) {
             addCollapsibleSection(body, '常用', 'shtx_folder_common', true, function(w) {
@@ -479,30 +574,31 @@
         if (hasOpenTool) {
             addCollapsibleSection(body, '批量', 'shtx_folder_batch', true, function(w) {
                 w.appendChild(makeBtn('收藏打开帖子', 'red', openFavoriteDialog));
-                w.appendChild(makeBtn('清理打开记录', 'gray', clearOpenThreadRecords));
+                w.appendChild(makeBtn('清理打开记录', 'gray', OpenThreadRegistry.clear));
             });
         }
 
-        appendSection(body, '状态');
-        appendStatusLine(body, 'page', '页面', getPageTypeLabel());
-        appendStatusLine(body, 'sign', '签到', getSignStatusText());
+        var statusPanel = document.createElement('div'); statusPanel.className = 'shtx-status-panel';
+        appendSection(statusPanel, '状态');
+        appendStatusLine(statusPanel, 'page', '页面', getPageTypeLabel());
+        appendStatusLine(statusPanel, 'sign', '签到', getSignStatusText());
         if (hasPreviewTool && isPreviewToolPage()) {
-            appendStatusLine(body, 'list-count', '主题', getThreadCountText());
-            appendStatusLine(body, 'preview', '预览', getPreviewStatusText());
+            appendStatusLine(statusPanel, 'list-count', '主题', getThreadCountText());
+            appendStatusLine(statusPanel, 'preview', '预览', getPreviewStatusText());
         }
-        if (isSearchResultPage()) appendStatusLine(body, 'search-filter', '筛选', getSearchFilterStatusText());
+        if (isSearchResultPage()) appendStatusLine(statusPanel, 'search-filter', '筛选', getSearchFilterStatusText());
         if (hasNextTool) {
-            appendStatusLine(body, 'scroll', '翻页', getPaginationStatusText());
-            appendStatusLine(body, 'next-message', '加载', getNextMessageText());
+            appendStatusLine(statusPanel, 'scroll', '翻页', getPaginationStatusText());
+            appendStatusLine(statusPanel, 'next-message', '加载', getNextMessageText());
         }
         if (hasThreadTool) {
-            appendStatusLine(body, 'thread-action', '操作', getThreadActionStatusText());
-            appendStatusLine(body, 'post-images', '图片', getPostImageStatusText());
+            appendStatusLine(statusPanel, 'thread-action', '操作', getThreadActionStatusText());
+            appendStatusLine(statusPanel, 'post-images', '图片', getPostImageStatusText());
         }
-        if (hasReplyTool) appendStatusLine(body, 'auto-reply', '自动回复', getBool(CONFIG.AUTO_REPLY_KEY, true) ? '开启' : '关闭');
-        if (hasOpenTool) appendStatusLine(body, 'open-count', '打开帖', openCount + ' 个');
+        if (hasReplyTool) appendStatusLine(statusPanel, 'auto-reply', '自动回复', getBool(CONFIG.AUTO_REPLY_KEY, true) ? '开启' : '关闭');
+        if (hasOpenTool) appendStatusLine(statusPanel, 'open-count', '打开帖', openCount + ' 个');
+        body.appendChild(statusPanel);
 
-        while (head.nextSibling && head.nextSibling !== body) body.appendChild(head.nextSibling);
         bar.appendChild(body);
         document.body.appendChild(bar);
     }
@@ -819,7 +915,15 @@
         return isNaN(p) ? 0 : p;
     }
     function getNextPageUrl(root) {
-        var a = $('.pg a.nxt[href], a.nxt[href]', root || document);
+        root = root || document;
+        var a = $('.pg a.nxt[href], a.nxt[href]', root);
+        if (!a) {
+            var links = $all('.pg a[href]', root);
+            for (var i = 0; i < links.length; i++) {
+                var label = textOf(links[i]);
+                if (/下一页|下页|next|›|»/i.test(label)) { a = links[i]; break; }
+            }
+        }
         return a ? normalizeUrl(a.getAttribute('href') || a.href) : '';
     }
     function buildNextPageUrl(page) {
@@ -841,6 +945,11 @@
         $all('.pg a[href], a.last[href]', root).forEach(function(a) {
             var href = a.getAttribute('href') || a.href || '';
             var m = href.match(/[?&]page=(\d+)/) || href.match(/thread-\d+-(\d+)-\d+\.html/i) || href.match(/forum-\d+-(\d+)\.html/i);
+            if (m) max = Math.max(max, parseInt(m[1], 10));
+        });
+        $all('.pg label span, .pg span[title]', root).forEach(function(el) {
+            var text = (el.getAttribute('title') || '') + ' ' + textOf(el);
+            var m = text.match(/共\s*(\d+)\s*页/) || text.match(/\/\s*(\d+)\s*页/);
             if (m) max = Math.max(max, parseInt(m[1], 10));
         });
         return max || 1;
@@ -1019,6 +1128,7 @@
         return height - (top + window.innerHeight) < CONFIG.AUTO_SCROLL_THRESHOLD;
     }
     function checkAndLoadIfContentNotEnough() {
+        if (!isAutoPaginationPage()) return;
         if (STATE.nextPagesLoading || STATE.autoScrollEnd) return;
         var sel = getContentSelector();
         var contentEl = sel ? document.querySelector(sel) : null;
@@ -1026,7 +1136,7 @@
         if (contentHeight <= window.innerHeight || isNearPageBottom()) loadNextPage(true);
     }
     function initAutoPagination() {
-        if (!isNextPageLoadPage()) return;
+        if (!isAutoPaginationPage()) return;
         if (!getBool(CONFIG.AUTO_PAGINATION_KEY, true)) return;
         if (STATE.nextScrollBound) return;
         STATE.nextScrollBound = true;
@@ -1560,17 +1670,228 @@
     }
 
     // ============ OPEN TABS ============
-    function getOpenTabId() { var id = ''; try { id = sessionStorage.getItem(CONFIG.OPEN_TAB_ID_KEY) || ''; } catch(e) {} if (!id) { id = String(Date.now()) + '_' + Math.random().toString(16).slice(2); try { sessionStorage.setItem(CONFIG.OPEN_TAB_ID_KEY, id); } catch(e) {} } return id; }
-    function cleanTitle(text) { return String(text || '').replace(/\s+/g, ' ').replace(/\s*[-_].*?色花堂.*$/i, '').trim(); }
-    function getThreadTitle() { var el = $('#thread_subject') || $('.ts span') || $('h1'); return cleanTitle(textOf(el) || document.title) || ('tid=' + getTid()); }
-    function readOpenRegistry() { return readJson(CONFIG.OPEN_REGISTRY_KEY, {}); }
-    function cleanOpenRegistry(reg) { var now = Date.now(); Object.keys(reg).forEach(function(tabId) { var item = reg[tabId]; if (!item || !item.tid || !item.updatedAt || now - item.updatedAt > CONFIG.OPEN_STALE_MS) delete reg[tabId]; }); return reg; }
-    function registerCurrentThread() { if (!isThreadPage()) return; var reg = cleanOpenRegistry(readOpenRegistry()); reg[getOpenTabId()] = { tid: getTid(), title: getThreadTitle(), url: ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(getTid()), updatedAt: Date.now() }; writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); setStatusLine('open-count', getOpenThreads().length + ' 个'); }
-    function unregisterCurrentThread() { if (!isThreadPage()) return; var reg = readOpenRegistry(); delete reg[getOpenTabId()]; writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); }
-    function getOpenThreads() { var reg = cleanOpenRegistry(readOpenRegistry()); writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); var byTid = {}; Object.keys(reg).forEach(function(tabId) { var item = reg[tabId]; if (!item || !item.tid) return; if (!byTid[item.tid] || byTid[item.tid].updatedAt < item.updatedAt) byTid[item.tid] = item; }); return Object.keys(byTid).map(function(tid) { return byTid[tid]; }).sort(function(a, b) { return b.updatedAt - a.updatedAt; }); }
-    function initOpenRegistry() { writeJson(CONFIG.OPEN_REGISTRY_KEY, cleanOpenRegistry(readOpenRegistry())); if (isThreadPage()) { registerCurrentThread(); _openRegistryTimers.push(setInterval(registerCurrentThread, CONFIG.OPEN_HEARTBEAT_MS)); window.addEventListener('beforeunload', unregisterCurrentThread); window.addEventListener('pagehide', unregisterCurrentThread); window.addEventListener('unload', unregisterCurrentThread); } _openRegistryTimers.push(setInterval(function() { setStatusLine('open-count', getOpenThreads().length + ' 个'); }, CONFIG.OPEN_HEARTBEAT_MS)); }
-    function clearOpenThreadRecords() { writeJson(CONFIG.OPEN_REGISTRY_KEY, {}); setStatusLine('open-count', '0 个'); toast('已清理'); createToolbar(); }
-    function removeOpenTid(tid) { var reg = readOpenRegistry(); Object.keys(reg).forEach(function(tabId) { if (reg[tabId] && reg[tabId].tid === tid) delete reg[tabId]; }); writeJson(CONFIG.OPEN_REGISTRY_KEY, reg); }
+    var OpenThreadRegistry = {
+        _cache: [],
+        hasTabStorage: function() {
+            return typeof GM_getTab === 'function' && typeof GM_saveTab === 'function' && typeof GM_getTabs === 'function';
+        },
+        getTabId: function() {
+            var id = '';
+            try { id = sessionStorage.getItem(CONFIG.OPEN_TAB_ID_KEY) || ''; } catch(e) {}
+            if (!id) {
+                id = String(Date.now()) + '_' + Math.random().toString(16).slice(2);
+                try { sessionStorage.setItem(CONFIG.OPEN_TAB_ID_KEY, id); } catch(e2) {}
+            }
+            return id;
+        },
+        cleanTitle: function(text) {
+            return String(text || '').replace(/\s+/g, ' ').replace(/\s*[-_].*?色花堂.*$/i, '').trim();
+        },
+        getThreadTitle: function() {
+            var el = $('#thread_subject') || $('.ts span') || $('h1');
+            return OpenThreadRegistry.cleanTitle(textOf(el) || document.title) || ('tid=' + getTid());
+        },
+        makeRecord: function(requestId) {
+            var tid = getTid(); if (!tid) return null;
+            return {
+                tid: tid,
+                title: OpenThreadRegistry.getThreadTitle(),
+                url: ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(tid),
+                updatedAt: Date.now(),
+                refreshId: requestId || ''
+            };
+        },
+        read: function() {
+            return readStoredJson(CONFIG.OPEN_REGISTRY_KEY, {});
+        },
+        write: function(reg) {
+            writeStoredJson(CONFIG.OPEN_REGISTRY_KEY, reg || {});
+        },
+        clean: function(reg) {
+            reg = reg || {};
+            var now = Date.now();
+            Object.keys(reg).forEach(function(tabId) {
+                var item = reg[tabId];
+                if (!item || !item.tid || !item.updatedAt || now - item.updatedAt > CONFIG.OPEN_STALE_MS) delete reg[tabId];
+            });
+            return reg;
+        },
+        recordsFromRegistry: function(reg) {
+            var byTid = {};
+            Object.keys(reg || {}).forEach(function(tabId) {
+                var item = reg[tabId];
+                if (!item || !item.tid) return;
+                if (!byTid[item.tid] || byTid[item.tid].updatedAt < item.updatedAt) byTid[item.tid] = item;
+            });
+            return Object.keys(byTid).map(function(tid) { return byTid[tid]; }).sort(function(a, b) { return b.updatedAt - a.updatedAt; });
+        },
+        recordsFromTabs: function(tabs) {
+            var reg = {};
+            Object.keys(tabs || {}).forEach(function(tabId) {
+                var item = tabs[tabId] && tabs[tabId][CONFIG.OPEN_TAB_RECORD_KEY];
+                if (item && item.tid) reg[tabId] = item;
+            });
+            return OpenThreadRegistry.recordsFromRegistry(OpenThreadRegistry.clean(reg));
+        },
+        saveCurrentTabRecord: function(record) {
+            if (!record) return Promise.resolve(null);
+            if (!OpenThreadRegistry.hasTabStorage()) return Promise.resolve(OpenThreadRegistry.saveCurrentFallbackRecord(record));
+            return new Promise(function(resolve) {
+                try {
+                    GM_getTab(function(tab) {
+                        tab = tab || {};
+                        tab[CONFIG.OPEN_TAB_RECORD_KEY] = record;
+                        GM_saveTab(tab, function() { resolve(record); });
+                    });
+                } catch(e) {
+                    resolve(OpenThreadRegistry.saveCurrentFallbackRecord(record));
+                }
+            });
+        },
+        saveCurrentFallbackRecord: function(record) {
+            var reg = OpenThreadRegistry.clean(OpenThreadRegistry.read());
+            reg[OpenThreadRegistry.getTabId()] = record;
+            OpenThreadRegistry.write(reg);
+            return record;
+        },
+        clearCurrentTabRecord: function() {
+            if (!OpenThreadRegistry.hasTabStorage()) {
+                var reg = OpenThreadRegistry.read();
+                delete reg[OpenThreadRegistry.getTabId()];
+                OpenThreadRegistry.write(reg);
+                return Promise.resolve();
+            }
+            return new Promise(function(resolve) {
+                try {
+                    GM_getTab(function(tab) {
+                        tab = tab || {};
+                        delete tab[CONFIG.OPEN_TAB_RECORD_KEY];
+                        GM_saveTab(tab, resolve);
+                    });
+                } catch(e) { resolve(); }
+            });
+        },
+        registerCurrent: function() {
+            if (!isThreadPage()) return;
+            var requestId = arguments.length ? arguments[0] : '';
+            return OpenThreadRegistry.saveCurrentTabRecord(OpenThreadRegistry.makeRecord(requestId)).then(function() {
+                OpenThreadRegistry.refreshCount();
+            });
+        },
+        unregisterCurrent: function() {
+            return OpenThreadRegistry.clearCurrentTabRecord().then(function() {
+                OpenThreadRegistry.refreshCount();
+            });
+        },
+        listFallback: function() {
+            var reg = OpenThreadRegistry.clean(OpenThreadRegistry.read());
+            OpenThreadRegistry.write(reg);
+            return OpenThreadRegistry.recordsFromRegistry(reg);
+        },
+        list: function() {
+            if (OpenThreadRegistry.hasTabStorage()) return (OpenThreadRegistry._cache || []).slice();
+            return OpenThreadRegistry.listFallback();
+        },
+        listAsync: function() {
+            return new Promise(function(resolve) {
+                if (!OpenThreadRegistry.hasTabStorage()) {
+                    var fallbackThreads = OpenThreadRegistry.listFallback();
+                    OpenThreadRegistry._cache = fallbackThreads;
+                    resolve(fallbackThreads);
+                    return;
+                }
+                try {
+                    GM_getTabs(function(tabs) {
+                        var threads = OpenThreadRegistry.recordsFromTabs(tabs);
+                        OpenThreadRegistry._cache = threads;
+                        resolve(threads);
+                    });
+                } catch(e) {
+                    var threads = OpenThreadRegistry.listFallback();
+                    OpenThreadRegistry._cache = threads;
+                    resolve(threads);
+                }
+            });
+        },
+        listSince: function(since) {
+            since = parseInt(since, 10) || 0;
+            return OpenThreadRegistry.list().filter(function(item) { return (item.updatedAt || 0) >= since; });
+        },
+        refreshCount: function() {
+            return OpenThreadRegistry.listAsync().then(function(threads) {
+                setStatusLine('open-count', threads.length + ' 个');
+                return threads;
+            });
+        },
+        waitForFreshRecords: function(since, onUpdate) {
+            var lastSig = '';
+            return new Promise(function(resolve) {
+                function poll() {
+                    OpenThreadRegistry.listAsync().then(function(threads) {
+                        if (!OpenThreadRegistry.hasTabStorage()) {
+                            threads = threads.filter(function(item) { return (item.updatedAt || 0) >= since; });
+                        }
+                        var sig = threads.map(function(item) { return item.tid + ':' + item.updatedAt + ':' + (item.refreshId || ''); }).join('|');
+                        if (sig !== lastSig) {
+                            lastSig = sig;
+                            if (typeof onUpdate === 'function') onUpdate(threads);
+                        }
+                        if (Date.now() - since >= CONFIG.OPEN_REFRESH_WAIT_MS) { resolve(threads); return; }
+                        setTimeout(poll, CONFIG.OPEN_REFRESH_POLL_MS);
+                    });
+                }
+                poll();
+            });
+        },
+        requestRefresh: function(onUpdate) {
+            var since = Date.now();
+            var requestId = String(since) + '_' + Math.random().toString(16).slice(2);
+            writeStoredJson(CONFIG.OPEN_REFRESH_KEY, { time: since, id: requestId, nonce: Math.random().toString(16).slice(2) });
+            if (isThreadPage()) OpenThreadRegistry.registerCurrent(requestId);
+            return OpenThreadRegistry.waitForFreshRecords(since, onUpdate);
+        },
+        handleRefreshRequest: function() {
+            if (!isThreadPage()) return;
+            var request = arguments.length ? arguments[0] : null;
+            var requestId = request && request.id ? request.id : '';
+            setTimeout(function() { OpenThreadRegistry.registerCurrent(requestId); }, 30 + Math.floor(Math.random() * 220));
+        },
+        listenRefreshRequests: function() {
+            if (OpenThreadRegistry._listening) return;
+            OpenThreadRegistry._listening = true;
+            OpenThreadRegistry._gmRefreshListener = addStoredValueListener(CONFIG.OPEN_REFRESH_KEY, function(value, oldValue, remote) {
+                if (remote === false) return;
+                OpenThreadRegistry.handleRefreshRequest(value);
+            });
+        },
+        init: function() {
+            OpenThreadRegistry.listenRefreshRequests();
+            if (isThreadPage()) {
+                OpenThreadRegistry.registerCurrent();
+                _openRegistryTimers.push(setInterval(OpenThreadRegistry.registerCurrent, CONFIG.OPEN_HEARTBEAT_MS));
+            } else {
+                OpenThreadRegistry.unregisterCurrent();
+            }
+            _openRegistryTimers.push(setInterval(function() {
+                OpenThreadRegistry.refreshCount();
+            }, CONFIG.OPEN_HEARTBEAT_MS));
+        },
+        clear: function() {
+            OpenThreadRegistry.write({});
+            OpenThreadRegistry._cache = [];
+            setStatusLine('open-count', '0 个');
+            toast('已清理');
+            createToolbar();
+        },
+        removeTid: function(tid) {
+            var reg = OpenThreadRegistry.read();
+            Object.keys(reg).forEach(function(tabId) {
+                if (reg[tabId] && reg[tabId].tid === tid) delete reg[tabId];
+            });
+            OpenThreadRegistry.write(reg);
+            OpenThreadRegistry._cache = OpenThreadRegistry._cache.filter(function(item) { return item && item.tid !== tid; });
+        }
+    };
     function getFavoriteConcurrency() {
         var n = parseInt(CONFIG.FAVORITE_CONCURRENCY, 10);
         if (isNaN(n)) n = 3;
@@ -1591,15 +1912,35 @@
         var pending = Math.max(stats.total - stats.done - stats.running, 0);
         progress.textContent = '进度 ' + stats.done + '/' + stats.total + '，运行中 ' + stats.running + '，待处理 ' + pending + '，成功 ' + stats.success + '，已收藏 ' + stats.exists + '，失败 ' + stats.failed;
     }
-    function openFavoriteDialog() {
-        var threads = getOpenThreads(); if (threads.length === 0) { toast('未检测到打开的帖子'); return; }
-        var dlg = createDialog('收藏打开帖子', '680px');
+    function renderFavoriteDialogRows(dlg, threads) {
+        threads = threads || [];
+        if (!threads.length) {
+            dlg.body.innerHTML = '<div class="shtx-status" style="padding:20px;text-align:center;">正在重新识别打开的帖子...</div>';
+            return;
+        }
         dlg.body.innerHTML = threads.map(function(item) { return '<div class="shtx-result-row" data-tid="' + escapeHtml(item.tid) + '"><a href="' + escapeHtml(item.url) + '" target="_blank">' + escapeHtml(item.title) + '</a><span class="shtx-status">待收藏</span><button class="shtx-btn shtx-gray" data-tid="' + escapeHtml(item.tid) + '" style="padding:3px 8px;">移除</button></div>'; }).join('');
-        $all('.shtx-btn.shtx-gray', dlg.body).forEach(function(btn) { btn.onclick = function() { removeOpenTid(this.getAttribute('data-tid')); var r = this.closest('.shtx-result-row'); if (r) r.remove(); }; });
+        $all('.shtx-btn.shtx-gray', dlg.body).forEach(function(btn) { btn.onclick = function() { OpenThreadRegistry.removeTid(this.getAttribute('data-tid')); var r = this.closest('.shtx-result-row'); if (r) r.remove(); }; });
+    }
+    function openFavoriteDialog() {
+        var dlg = createDialog('收藏打开帖子', '680px');
+        var threads = [];
+        renderFavoriteDialogRows(dlg, threads);
         var progress = document.createElement('div'); progress.className = 'shtx-status'; dlg.foot.appendChild(progress);
         var startBtn = makeBtn('开始收藏', 'red', function() { batchFavoriteOpened(getFavoriteDialogThreads(dlg.root, threads), progress, dlg.root, startBtn); });
         dlg.foot.appendChild(startBtn);
         dlg.foot.appendChild(makeBtn('刷新列表', 'blue', function() { dlg.close(); openFavoriteDialog(); }));
+        progress.textContent = '正在重新识别打开的帖子...';
+        toast('正在重新识别打开的帖子...');
+        return OpenThreadRegistry.requestRefresh(function(freshThreads) {
+            threads = freshThreads;
+            renderFavoriteDialogRows(dlg, threads);
+            progress.textContent = threads.length ? ('已识别 ' + threads.length + ' 个打开帖子，继续等待响应...') : '正在重新识别打开的帖子...';
+        }).then(function(finalThreads) {
+            threads = finalThreads || [];
+            renderFavoriteDialogRows(dlg, threads);
+            progress.textContent = threads.length ? ('已识别 ' + threads.length + ' 个打开帖子') : '未检测到打开的帖子';
+            if (!threads.length) toast('未检测到打开的帖子');
+        });
     }
     function batchFavoriteOpened(threads, progress, root, btn) {
         if (STATE.favoriteOpenedRunning || (btn && btn.disabled)) { toast('批量收藏正在运行'); return; }
@@ -1611,33 +1952,29 @@
             STATE.favoriteOpenedRunning = false;
             if (btn) { btn.disabled = false; btn.textContent = text || '开始收藏'; }
         }
-        function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
         getFormhash().then(function(fh) {
             if (!fh) throw new Error('请确认已登录');
             var stats = { total: threads.length, done: 0, running: 0, success: 0, exists: 0, failed: 0 };
-            var nextIndex = 0;
-            var concurrency = Math.min(getFavoriteConcurrency(), threads.length);
             updateFavoriteBatchProgress(progress, stats);
-            function worker() {
-                var index = nextIndex++;
-                if (index >= threads.length) return Promise.resolve();
-                var item = threads[index];
-                stats.running++;
-                setFavoriteRow(root, item.tid, '收藏中...', '#3498db');
-                updateFavoriteBatchProgress(progress, stats);
-                return favoriteThread(item.tid, fh).catch(function() {
-                    return { state: 'error', label: '网络失败' };
-                }).then(function(r) {
-                    stats.running--;
-                    stats.done++;
-                    if (r.state === 'success') { stats.success++; setFavoriteRow(root, item.tid, r.label, '#27ae60'); }
-                    else if (r.state === 'exists') { stats.exists++; setFavoriteRow(root, item.tid, r.label, '#999'); }
-                    else { stats.failed++; setFavoriteRow(root, item.tid, r.label, '#e74c3c'); }
+            return runLimitedQueue(threads, {
+                concurrency: getFavoriteConcurrency(),
+                delay: getFavoriteWorkerDelay(),
+                run: function(item) {
+                    stats.running++;
+                    setFavoriteRow(root, item.tid, '收藏中...', '#3498db');
                     updateFavoriteBatchProgress(progress, stats);
-                    return wait(getFavoriteWorkerDelay());
-                }).then(worker);
-            }
-            return Promise.all(Array.from({ length: concurrency }, worker)).then(function() {
+                    return favoriteThread(item.tid, fh).catch(function() {
+                        return { state: 'error', label: '网络失败' };
+                    }).then(function(r) {
+                        stats.running--;
+                        stats.done++;
+                        if (r.state === 'success') { stats.success++; setFavoriteRow(root, item.tid, r.label, '#27ae60'); }
+                        else if (r.state === 'exists') { stats.exists++; setFavoriteRow(root, item.tid, r.label, '#999'); }
+                        else { stats.failed++; setFavoriteRow(root, item.tid, r.label, '#e74c3c'); }
+                        updateFavoriteBatchProgress(progress, stats);
+                    });
+                }
+            }).then(function() {
                 updateFavoriteBatchProgress(progress, stats);
                 appendTaskLog('fav', '批量收藏完成', '成功 ' + stats.success + '，已收藏 ' + stats.exists + '，失败 ' + stats.failed);
                 toast('批量收藏完成');
@@ -1653,38 +1990,176 @@
 
     // ============ SEARCH & EXPORT ============
     function buildListPageUrl(page) { if (isFavoritePage()) return ORIGIN + '/home.php?mod=space&uid=' + encodeURIComponent(getUid()) + '&do=favorite&view=me&page=' + page; var url = new URL(location.href); url.searchParams.set('page', page); return url.href; }
+    function getSearchDefaultEndPage() {
+        var max = Math.max(detectMaxPage(document) || 1, STATE.listMaxPage || 1);
+        STATE.listMaxPage = Math.max(STATE.listMaxPage || 1, max);
+        return max || 1;
+    }
+    function getSearchConcurrency() {
+        var n = parseInt(CONFIG.SEARCH_CONCURRENCY, 10);
+        if (isNaN(n)) n = 4;
+        return Math.max(1, Math.min(8, n));
+    }
+    function parseSearchPageRange(startInput, endInput) {
+        var startRaw = startInput ? startInput.value.trim() : '';
+        var endRaw = endInput ? endInput.value.trim() : '';
+        var followNext = !endRaw;
+        var start = startRaw ? parseInt(startRaw, 10) : 1;
+        var end = endRaw ? parseInt(endRaw, 10) : getSearchDefaultEndPage();
+        if (!start || start < 1) start = 1;
+        if (!end || end < 1) end = getSearchDefaultEndPage();
+        if (start > end) { var t = start; start = end; end = t; }
+        return { start: start, end: end, followNext: followNext };
+    }
+    function fetchSearchPage(p, pageUrl, kwLower) {
+        return fetch(pageUrl, { credentials: 'include' }).then(function(r) { return r.text(); }).then(function(html) {
+            var doc = new DOMParser().parseFromString(html, 'text/html');
+            return {
+                page: p,
+                nextUrl: getNextPageUrl(doc),
+                matches: getThreadsWithLinks(doc).filter(function(t) { return t.title.toLowerCase().indexOf(kwLower) !== -1; })
+            };
+        }).catch(function() {
+            return { page: p, nextUrl: '', matches: [], failed: true };
+        });
+    }
+    function appendSearchMatches(matches, kw, page, div, seenTids) {
+        var added = 0;
+        (matches || []).forEach(function(t) {
+            if (!t || !t.tid) return;
+            if (seenTids[t.tid]) return;
+            seenTids[t.tid] = true;
+            added++;
+            var row = document.createElement('div'); row.className = 'shtx-result-row';
+            row.setAttribute('data-tid', t.tid);
+            row.innerHTML = '<a target="_blank" href="' + ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(t.tid) + '">' + highlightKeyword(t.title, kw) + '</a><span class="shtx-status">第' + page + '页</span>';
+            div.appendChild(row);
+        });
+        return added;
+    }
+    function getSearchResultThreads(root) {
+        var seen = {}, threads = [];
+        $all('.shtx-result-row a[href]', root || document).forEach(function(a) {
+            var row = a.closest ? a.closest('.shtx-result-row') : null;
+            var href = normalizeUrl(a.getAttribute('href') || a.href || '');
+            var tid = getTidFromHref(href) || (row ? row.getAttribute('data-tid') : '');
+            if (!href || !tid || seen[tid]) return;
+            seen[tid] = true;
+            threads.push({ tid: tid, url: href, title: textOf(a) || href });
+        });
+        return threads;
+    }
+    function getSearchResultLinks(root) {
+        return getSearchResultThreads(root).map(function(item) { return item.url; });
+    }
+    function openSearchResultTab(url) {
+        if (typeof GM_openInTab === 'function') { GM_openInTab(url, { active: false, insert: true, setParent: true }); return true; }
+        if (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') { GM.openInTab(url, { active: false, insert: true, setParent: true }); return true; }
+        var win = window.open(url, '_blank');
+        if (win) { try { win.opener = null; } catch(e) {} return true; }
+        return false;
+    }
+    function openCurrentSearchResults(root, footer) {
+        var links = getSearchResultLinks(root), opened = 0;
+        if (!links.length) { toast('当前没有可打开的搜索结果'); return; }
+        links.forEach(function(url) { if (openSearchResultTab(url)) opened++; });
+        if (footer) footer.textContent = '已打开 ' + opened + '/' + links.length + ' 个搜索结果';
+        toast('已打开 ' + opened + ' 个搜索结果');
+    }
+    function favoriteCurrentSearchResults(root, progress, btn) {
+        batchFavoriteOpened(getSearchResultThreads(root), progress, root, btn);
+    }
     function openSearchDialog() {
         var dlg = createDialog(isFavoritePage() ? '收藏搜索' : '主题搜索', '720px');
         $('.shtx-close', dlg.root).onclick = function() { STATE.searchCancelled = true; dlg.close(); };
         dlg.body.innerHTML = '<div class="shtx-row"><label>关键词：</label><input id="shtx-search-kw" class="shtx-input" style="flex:1;" placeholder="输入搜索关键词"></div>' +
-            '<div class="shtx-row"><label>页码范围：</label><input id="shtx-search-start" class="shtx-input" type="number" min="1" value="1" style="width:64px;">至<input id="shtx-search-end" class="shtx-input" type="number" min="1" value="' + (STATE.listMaxPage || CONFIG.ALL_PAGES) + '" style="width:64px;"></div>' +
+            '<div class="shtx-row"><label>页码范围：</label><input id="shtx-search-start" class="shtx-input" type="number" min="1" value="" style="width:64px;">至<input id="shtx-search-end" class="shtx-input" type="number" min="1" value="" style="width:64px;"></div>' +
             '<div id="shtx-search-results" style="min-height:100px;"><div style="text-align:center;padding:30px;color:#ccc;font-size:13px;">输入关键词和页码范围后点击开始搜索</div></div>';
         var footer = document.createElement('div'); footer.className = 'shtx-status'; dlg.foot.appendChild(footer);
         var startBtn = makeBtn('开始搜索', 'red', function() {
-            var kw = $('#shtx-search-kw').value.trim(); var s = parseInt($('#shtx-search-start').value, 10) || 1; var e = parseInt($('#shtx-search-end').value, 10) || STATE.listMaxPage || CONFIG.ALL_PAGES;
-            if (!kw) { toast('请输入关键词'); return; } if (s > e) { var t = s; s = e; e = t; }
-            runSearch(kw, s, e, $('#shtx-search-results'), footer, startBtn);
+            var kw = $('#shtx-search-kw').value.trim(); var range = parseSearchPageRange($('#shtx-search-start'), $('#shtx-search-end'));
+            if (!kw) { toast('请输入关键词'); return; }
+            runSearch(kw, range.start, range.end, $('#shtx-search-results'), footer, startBtn, range.followNext);
         });
+        var favoriteBtn = makeBtn('一键收藏当前结果', 'green', function() { favoriteCurrentSearchResults($('#shtx-search-results', dlg.root), footer, favoriteBtn); });
         dlg.foot.appendChild(startBtn);
+        dlg.foot.appendChild(makeBtn('暂停搜索', 'gray', function() { STATE.searchCancelled = true; footer.textContent = '正在暂停搜索...'; }));
+        dlg.foot.appendChild(makeBtn('一键打开当前结果', 'blue', function() { openCurrentSearchResults($('#shtx-search-results', dlg.root), footer); }));
+        dlg.foot.appendChild(favoriteBtn);
         dlg.foot.appendChild(makeBtn('取消', 'gray', function() { STATE.searchCancelled = true; dlg.close(); }));
     }
-    function runSearch(kw, start, end, div, footer, btn) {
+    function runSearch(kw, start, end, div, footer, btn, followNext) {
         STATE.searchCancelled = false; btn.disabled = true; btn.textContent = '搜索中...'; div.innerHTML = '';
-        var total = 0, kwLower = kw.toLowerCase();
-        function page(p) {
-            if (p > end || STATE.searchCancelled) { footer.textContent = STATE.searchCancelled ? '已取消，共' + total + '个' : '完成，共' + total + '个匹配'; btn.disabled = false; btn.textContent = '开始搜索'; return; }
-            footer.textContent = '搜索第 ' + p + ' 页...';
-            fetch(buildListPageUrl(p), { credentials: 'include' }).then(function(r) { return r.text(); }).then(function(html) {
-                var doc = new DOMParser().parseFromString(html, 'text/html');
-                getThreadsWithLinks(doc).forEach(function(t) { if (t.title.toLowerCase().indexOf(kwLower) === -1) return; total++;
-                    var row = document.createElement('div'); row.className = 'shtx-result-row';
-                    row.innerHTML = '<a target="_blank" href="' + ORIGIN + '/forum.php?mod=viewthread&tid=' + encodeURIComponent(t.tid) + '">' + highlightKeyword(t.title, kw) + '</a><span class="shtx-status">第' + p + '页</span>';
-                    div.appendChild(row);
-                });
-                footer.textContent = '已搜 ' + (p - start + 1) + '/' + (end - start + 1) + ' 页，共' + total + '个';
-            }).catch(function() {}).then(function() { setTimeout(function() { page(p + 1); }, 120); });
+        var concurrency = getSearchConcurrency(), total = 0, failed = 0, kwLower = kw.toLowerCase();
+        var active = 0, nextPage = start, flushPage = start, completed = 0, done = false;
+        var stopPage = followNext ? 0 : end;
+        var maxPage = followNext ? (start + CONFIG.ALL_PAGES - 1) : end;
+        var results = {}, seenTids = {};
+        function finish(cancelled, text) {
+            if (done) return;
+            done = true;
+            footer.textContent = text || (cancelled ? '已取消，共' + total + '个' : '完成，共' + total + '个匹配');
+            btn.disabled = false; btn.textContent = '开始搜索';
         }
-        page(start);
+        function canQueue() {
+            if (STATE.searchCancelled || done) return false;
+            if (!followNext) return nextPage <= end;
+            if (stopPage) return nextPage <= stopPage;
+            return nextPage <= maxPage;
+        }
+        function updateFooter() {
+            if (done) return;
+            var rangeText = followNext ? ('已搜 ' + completed + ' 页，并发 ' + active + '/' + concurrency) : ('已搜 ' + completed + '/' + (end - start + 1) + ' 页，并发 ' + active + '/' + concurrency);
+            footer.textContent = rangeText + '，共' + total + '个' + (failed ? '，失败 ' + failed + ' 页' : '');
+        }
+        function flushResults() {
+            while (results[flushPage]) {
+                var r = results[flushPage];
+                if ((!followNext || !stopPage || flushPage <= stopPage) && !r.failed) {
+                    total += appendSearchMatches(r.matches, kw, r.page, div, seenTids);
+                }
+                delete results[flushPage];
+                flushPage++;
+            }
+        }
+        function maybeFinish() {
+            if (done) return;
+            if (STATE.searchCancelled && active === 0) { flushResults(); finish(true); return; }
+            if (followNext && !stopPage && nextPage > maxPage && active === 0) {
+                flushResults(); finish(false, '已达到搜索安全上限 ' + CONFIG.ALL_PAGES + ' 页，共' + total + '个匹配'); return;
+            }
+            var finalPage = followNext ? stopPage : end;
+            if (finalPage && flushPage > finalPage && active === 0) { finish(false); return; }
+            queueMore();
+        }
+        function queuePage(p) {
+            active++;
+            updateFooter();
+            fetchSearchPage(p, buildListPageUrl(p), kwLower).then(function(r) {
+                results[p] = r;
+                completed++;
+                if (r.failed) failed++;
+                if (followNext && r.nextUrl) {
+                    var nextNumber = getPageNumberFromUrl(r.nextUrl);
+                    if (nextNumber) STATE.listMaxPage = Math.max(STATE.listMaxPage || 1, nextNumber);
+                }
+                if (followNext && !r.nextUrl) {
+                    if (!stopPage || p < stopPage) stopPage = p;
+                }
+            }).then(function() {
+                active--;
+                flushResults();
+                updateFooter();
+                setTimeout(maybeFinish, 80);
+            });
+        }
+        function queueMore() {
+            while (active < concurrency && canQueue()) {
+                queuePage(nextPage++);
+            }
+            if (active === 0) maybeFinish();
+        }
+        queueMore();
     }
     function highlightKeyword(text, kw) { return escapeHtml(text).replace(new RegExp('(' + escapeRegExp(escapeHtml(kw)) + ')', 'gi'), '<span style="background:#ffd54f;padding:0 2px;">$1</span>'); }
 
@@ -1999,9 +2474,8 @@
     }
 
     function runExport(threads, progress, done, isCancelled) {
-        var results = [], nextIndex = 0, finished = 0, stopped = false;
+        var results = [], finished = 0, stopped = false;
         var parseQueue = [], parsing = 0;
-        function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
         function runParseQueue() {
             while (parsing < CONFIG.ATTACH_PARSE_CONCURRENCY && parseQueue.length > 0) {
                 (function(item) {
@@ -2022,23 +2496,22 @@
                 })(parseQueue.shift());
             }
         }
-        function worker() {
-            if (stopped || isCancelled()) { stopped = true; return Promise.resolve(); }
-            var i = nextIndex++; if (i >= threads.length) return Promise.resolve();
-            var start = Date.now();
-            progress.textContent = '帖子 ' + (finished + 1) + '/' + threads.length + '：' + threads[i].title.substring(0, 40);
-            return extractResourceLinks(threads[i].tid, threads[i].title).then(function(r) {
-                results[i] = r; finished++;
-                if (r.attachments && r.attachments.length) {
-                    r.attachments.forEach(function(att) { parseQueue.push({ result: r, att: att }); });
-                    runParseQueue();
-                }
-            }).then(function() {
-                return wait(Math.max(0, CONFIG.EXPORT_DELAY_MS - (Date.now() - start)));
-            }).then(worker);
-        }
-        var count = Math.min(CONFIG.EXPORT_CONCURRENCY, threads.length);
-        Promise.all(Array.from({ length: count }, worker)).then(function() {
+        runLimitedQueue(threads, {
+            concurrency: CONFIG.EXPORT_CONCURRENCY,
+            shouldStop: function() { return stopped || isCancelled(); },
+            delay: function(item, index, result, elapsed) { return Math.max(0, CONFIG.EXPORT_DELAY_MS - elapsed); },
+            run: function(thread, i) {
+                progress.textContent = '帖子 ' + (finished + 1) + '/' + threads.length + '：' + thread.title.substring(0, 40);
+                return extractResourceLinks(thread.tid, thread.title).then(function(r) {
+                    results[i] = r; finished++;
+                    if (r.attachments && r.attachments.length) {
+                        r.attachments.forEach(function(att) { parseQueue.push({ result: r, att: att }); });
+                        runParseQueue();
+                    }
+                });
+            }
+        }).then(function(queue) {
+            if (queue && queue.stopped) stopped = true;
             var pollStart = Date.now();
             function pollParse() {
                 if (stopped || isCancelled()) { progress.textContent = '已停止'; return; }
@@ -2094,7 +2567,7 @@
     }
 
     function init() {
-        addStyle(); cleanup(); initOpenRegistry(); initListTools(); applySearchFilter(); createToolbar();
+        addStyle(); cleanup(); OpenThreadRegistry.init(); initListTools(); applySearchFilter(); createToolbar();
         initThreadEnhancements(); initAutoSign(false); initAutoPagination(); startMutationObserver();
         if (isThreadPage() && getFid() === CONFIG.AUTO_REPLY_TARGET_FID && getBool(CONFIG.AUTO_REPLY_KEY, true)) setTimeout(runAutoReply, 1200);
         if (typeof GM_registerMenuCommand === 'function') {
@@ -2104,15 +2577,16 @@
 
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) { pauseAll(); }
-            else { resumeAll(); registerCurrentThread(); }
+            else { resumeAll(); OpenThreadRegistry.registerCurrent(); }
         });
         window.addEventListener('storage', function(e) {
+            if (e.key === CONFIG.OPEN_REFRESH_KEY) { OpenThreadRegistry.handleRefreshRequest(); return; }
             if (e.key !== CONFIG.OPEN_REGISTRY_KEY) return;
             var now = Date.now();
             if (now - _storageDebounce < 500) return;
             _storageDebounce = now;
             var bar = $('#shtx-toolbar');
-            if (bar) { setStatusLine('open-count', getOpenThreads().length + ' 个'); return; }
+            if (bar) { setStatusLine('open-count', OpenThreadRegistry.list().length + ' 个'); return; }
             createToolbar();
         });
     }
